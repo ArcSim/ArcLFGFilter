@@ -1,0 +1,12 @@
+## Interface: 16001
+## Title: |cff3fc9f2Arc|r LFG Filter
+## Notes: Filter the Looking For Group list by role, class, players or groups, and groups with a spot for you. Can whisper the players you invite. /arclfg
+## Author: Arc
+## Version: 1.0.0
+## AllowLoadGameType: camelot
+## IconTexture: Interface\AddOns\ArcLFGFilter\Media\ArcLFGFilter_Icon
+## SavedVariables: ArcLFGFilterDB
+## X-Curse-Project-ID: 1706273
+
+ALF_Theme.lua
+ArcLFGFilter.lua
