@@ -6,8 +6,9 @@ local ADDON, NS = ...
 --   Show        - players and groups / players only / groups only
 --   Players     - Tank / Healer / DPS: solo players who signed up for a
 --                 ticked role (the role icons Blizzard shows), plus a Class
---                 submenu (every class the game has, with counts); role and
---                 class ticks combine, so DPS + Mage = DPS mages
+--                 submenu (every class the game has, with counts) and a typed
+--                 Minimum level; role, class and level combine, so DPS + Mage
+--                 = DPS mages
 --   Groups      - "has a spot for me": groups with an open slot for a role
 --                 YOU are queued as (C_LFGListRoles.GetRoles, the same source
 --                 Blizzard uses to rank groups) via the *_REMAINING counts;
@@ -96,6 +97,7 @@ local DELISTED_COLOR   = { r = 0.3, g = 0.3, b = 0.3 }
 local active = {}                   -- [role key] = true while that role is ticked
 local classActive = {}              -- [classFile] = true while that class is ticked
 local groupExclude = {}             -- [classFile] = true: hide groups with that class in them
+local minLevel                      -- nil, or the lowest level a solo player may be
 local showMode = "both"             -- "both", "players" or "groups"
 local openSpotOnly = false          -- groups: only those with a slot for my role
 local shownCount, totalCount = 0, 0 -- result of the last rebuild of our list
@@ -110,6 +112,14 @@ local selectedID                    -- the listing selected in our list
 local collapsed = {}                -- [category] = true while its header is shut
 local rebuildQueued = false
 local logLines, logBatching = {}, false
+
+-- Extension points for a companion addon, which reads this addon's table via
+-- C_AddOns.GetAddOnLocalTable (the toc opts in with AllowAddOnTableAccess):
+-- functions(root) run while the menu is built, and functions(tooltip) that
+-- add lines to the button tooltip. Empty for everyone else. The read-only
+-- API they use is set at the bottom of this file.
+NS.menuExtras = NS.menuExtras or {}
+NS.tooltipExtras = NS.tooltipExtras or {}
 
 -------------------------------------------------------------------------------
 -- Debug log
@@ -159,6 +169,13 @@ end
 
 local function FilterActive()
 	return showMode ~= "both" or openSpotOnly or AnyRoleTicked() or AnyClassTicked() or AnyGroupExclusion()
+		or minLevel ~= nil
+end
+
+-- A rule about which PLAYERS match (role, class or level), as opposed to the
+-- show mode or group rules.
+local function HasPlayerRules()
+	return (AnyRoleTicked() or AnyClassTicked() or minLevel ~= nil) and true or false
 end
 
 local function ActiveNames()
@@ -227,6 +244,7 @@ local function FilterSummary()
 	if showMode ~= "groups" then
 		if AnyRoleTicked() then parts[#parts + 1] = "players: " .. ActiveNames() end
 		if AnyClassTicked() then parts[#parts + 1] = "class: " .. ClassNames(classActive) end
+		if minLevel then parts[#parts + 1] = "level " .. minLevel .. "+" end
 	end
 	if showMode ~= "players" then
 		if openSpotOnly then parts[#parts + 1] = "groups: spot for " .. MyRolesText() end
@@ -256,10 +274,15 @@ local function Verdict(resultID)
 	if numMembers == 1 then
 		if showMode == "groups" then return false end
 		local wantRoles, wantClasses = AnyRoleTicked(), AnyClassTicked()
-		if not (wantRoles or wantClasses) then return true end
+		if not (wantRoles or wantClasses or minLevel) then return true end
 		local member = C_LFGList.GetSearchResultPlayerInfo(resultID, 1)
 		if not member then return false end
 		if issecret(member) then return nil end
+		if minLevel then
+			local level = member.level
+			if issecret(level) then return nil end
+			if not level or level < minLevel then return false end
+		end
 		if wantClasses then
 			local classFile = member.classFilename
 			if issecret(classFile) then return nil end
@@ -493,12 +516,18 @@ local function SendWhisper(text, target)
 	end
 end
 
--- Post-hook on C_PartyInfo.InviteUnit: the invite has already run (and
--- Blizzard's stays secure); this runs right after it, inside the same click.
-local function OnInviteUnit(name)
-	if not WhisperOn() then return end
-	local frame = LFGBrowseFrame
-	if not (frame and frame:IsVisible()) then return end
+-- Whispers the invite message to a listed solo player just invited. From a
+-- click (the InviteUnit hook) it needs the whisper switch on and the browse
+-- window open; `auto` (an invite made through a companion addon) skips both -
+-- such an invite must always explain itself - but every other gate
+-- (lockdown, listed solo player, the one-minute repeat guard) still applies,
+-- so the hook and the companion firing for the same invite whisper once.
+local function WhisperInvitee(name, auto)
+	if not auto then
+		if not WhisperOn() then return end
+		local frame = LFGBrowseFrame
+		if not (frame and frame:IsVisible()) then return end
+	end
 	if issecret(name) or type(name) ~= "string" then
 		Log("invite: name unreadable - no whisper")
 		return
@@ -527,6 +556,12 @@ local function OnInviteUnit(name)
 	lastWhisper[name] = now
 	SendWhisper(text, name)
 	Log("invite: whispered " .. name .. ": " .. text)
+end
+
+-- Post-hook on C_PartyInfo.InviteUnit: the invite has already run (and
+-- Blizzard's stays secure); this runs right after it, inside the same click.
+local function OnInviteUnit(name)
+	WhisperInvitee(name, false)
 end
 
 -------------------------------------------------------------------------------
@@ -850,6 +885,452 @@ local function OpenWhisperBox(name)
 end
 
 -------------------------------------------------------------------------------
+-- Popup menus: this addon's own, drawn with Forever's menu art
+-------------------------------------------------------------------------------
+-- Blizzard's menu system (MenuUtil) is shared by every menu in the game.
+-- Opening one from addon code left it running on this addon's taint, and
+-- Blizzard's own LFG Category dropdown then could not search:
+-- "[ADDON_ACTION_BLOCKED] AddOn 'ArcLFGFilter' tried to call the protected
+-- function 'Search()'" from Menu.lua Pick (2026-09-21). So the funnel and row
+-- menus are drawn here, on this addon's frames, and never go near it. The
+-- look copies Blizzard's MenuStyle1 (Mainline MenuTemplates / MenuVariants):
+-- common-dropdown-bg at .925 alpha overhanging 10/3, insets 8/8/8/15, 20px
+-- rows, 13px tooltip dividers, square and radial ticks with the yellow marks,
+-- the chat expand arrow for submenus and the quest title highlight.
+--
+-- The builder mirrors the subset of Blizzard's menu description API this
+-- addon (and its companion) uses - CreateTitle / CreateButton / CreateCheckbox
+-- / CreateRadio / CreateDivider, SetResponse / SetEnabled / AddInitializer -
+-- so the generators read the same. Defaults as Blizzard: checkboxes stay
+-- open and refresh, radios and buttons close unless SetResponse(REFRESH).
+-- One kind of our own, CreateInput: a label with a small typed box (the
+-- Minimum level, Arc 2026-09-21: "I want this to be a user input").
+
+local REFRESH = (MenuResponse and MenuResponse.Refresh) or "refresh"
+local POPUP_ROW_H, POPUP_DIVIDER_H = 20, 13
+local POPUP_INSET_L, POPUP_INSET_T, POPUP_INSET_R, POPUP_INSET_B, POPUP_PAD_W = 8, 8, 8, 15, 20
+local POPUP_INPUT_H, POPUP_INPUT_W, POPUP_INPUT_GAP = 24, 36, 12
+
+local PopupNode = {}
+PopupNode.__index = PopupNode
+
+local function NewPopupNode(kind, text)
+	return setmetatable({ kind = kind, text = text, children = {}, enabled = true, inits = {} }, PopupNode)
+end
+
+function PopupNode:Add(kind, text)
+	local node = NewPopupNode(kind, text)
+	self.children[#self.children + 1] = node
+	return node
+end
+
+function PopupNode:CreateTitle(text)
+	return self:Add("title", text)
+end
+
+function PopupNode:CreateDivider()
+	return self:Add("divider")
+end
+
+function PopupNode:CreateButton(text, callback, data)
+	local node = self:Add("button", text)
+	node.callback, node.data = callback, data
+	return node
+end
+
+function PopupNode:CreateCheckbox(text, isSelected, setSelected, data)
+	local node = self:Add("checkbox", text)
+	node.isSelected, node.setSelected, node.data = isSelected, setSelected, data
+	node.response = REFRESH
+	return node
+end
+
+function PopupNode:CreateRadio(text, isSelected, setSelected, data)
+	local node = self:Add("radio", text)
+	node.isSelected, node.setSelected, node.data = isSelected, setSelected, data
+	return node
+end
+
+-- A label with a typed box on the right. get() gives the text to show and
+-- set(text) runs on every keystroke; the menu stays open and refreshes, and
+-- the box keeps what is being typed until it loses focus. opts: numeric,
+-- maxLetters, width, placeholder (shown while the box is empty).
+function PopupNode:CreateInput(text, get, set, opts)
+	local node = self:Add("input", text)
+	node.get, node.set, node.opts = get, set, opts or {}
+	return node
+end
+
+function PopupNode:SetResponse(response)
+	self.response = response
+end
+
+function PopupNode:SetEnabled(on)
+	self.enabled = on and true or false
+end
+
+function PopupNode:AddInitializer(fn)
+	self.inits[#self.inits + 1] = fn
+end
+
+local popup = { panels = {}, openPath = {} } -- panels[level], 1 = the root
+local hookedOwners = setmetatable({}, { __mode = "k" })
+local RefreshPopup, ClosePopup -- defined below; rows call them
+
+local function TextWidth(fs)
+	return (fs.GetUnboundedStringWidth and fs:GetUnboundedStringWidth()) or fs:GetStringWidth() or 0
+end
+
+local function MouseOverPopup()
+	for _, panel in pairs(popup.panels) do
+		if panel:IsShown() and panel:IsMouseOver() then return true end
+	end
+	return false
+end
+
+-- Hides the panels from `level` down.
+local function ClosePopupFrom(level)
+	for l, panel in pairs(popup.panels) do
+		if l >= level then panel:Hide() end
+	end
+end
+
+local function PopupPanel(level)
+	local panel = popup.panels[level]
+	if panel then return panel end
+	panel = CreateFrame("Frame", level == 1 and "ArcLFGFilterPopup" or nil, UIParent)
+	panel:SetFrameStrata("FULLSCREEN_DIALOG")
+	panel:SetToplevel(true)
+	panel:SetClampedToScreen(true)
+	panel:EnableMouse(true)
+	panel.level = level
+	local bg = panel:CreateTexture(nil, "BACKGROUND")
+	bg:SetAtlas("common-dropdown-bg")
+	bg:SetPoint("TOPLEFT", -10, 3)
+	bg:SetPoint("BOTTOMRIGHT", 10, -3)
+	bg:SetAlpha(0.925)
+	panel.rows = {}
+	panel:Hide()
+	if level == 1 then
+		tinsert(UISpecialFrames, "ArcLFGFilterPopup") -- Escape closes it
+		-- a click anywhere else closes it, like Blizzard's menus
+		panel:SetScript("OnShow", function(self) self:RegisterEvent("GLOBAL_MOUSE_DOWN") end)
+		panel:SetScript("OnHide", function(self)
+			self:UnregisterEvent("GLOBAL_MOUSE_DOWN")
+			ClosePopupFrom(2)
+			popup.generator, popup.owner = nil, nil
+		end)
+		panel:SetScript("OnEvent", function()
+			if MouseOverPopup() then return end
+			if popup.owner and popup.owner:IsMouseOver() then return end -- its click toggles
+			ClosePopup()
+		end)
+	end
+	popup.panels[level] = panel
+	return panel
+end
+
+local PopupRowEnter, PopupRowLeave, PopupRowClick -- defined below
+
+local function PopupRow(panel, i)
+	local row = panel.rows[i]
+	if row then return row end
+	row = CreateFrame("Button", nil, panel)
+	row.panel = panel
+	row:SetHeight(POPUP_ROW_H)
+	row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	row.highlight = row:CreateTexture(nil, "BACKGROUND")
+	row.highlight:SetTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
+	row.highlight:SetBlendMode("ADD")
+	row.highlight:SetAllPoints()
+	row.highlight:Hide()
+	row.tick = row:CreateTexture(nil, "ARTWORK")
+	row.mark = row:CreateTexture(nil, "ARTWORK", nil, 1)
+	row.fontString = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+	row.fontString:SetJustifyH("LEFT")
+	row.fontString:SetWordWrap(false)
+	row.arrow = row:CreateTexture(nil, "ARTWORK")
+	row.arrow:SetTexture("Interface\\ChatFrame\\ChatFrameExpandArrow")
+	row.arrow:SetSize(16, 16)
+	row.arrow:SetPoint("RIGHT")
+	row.divider = row:CreateTexture(nil, "ARTWORK")
+	row.divider:SetTexture("Interface\\Common\\UI-TooltipDivider-Transparent")
+	row.divider:SetPoint("LEFT")
+	row.divider:SetPoint("RIGHT")
+	row.divider:SetHeight(POPUP_DIVIDER_H)
+	row:SetScript("OnEnter", PopupRowEnter)
+	row:SetScript("OnLeave", PopupRowLeave)
+	row:SetScript("OnClick", PopupRowClick)
+	panel.rows[i] = row
+	return row
+end
+
+-- The box of an input entry, made on first use and kept with its row. It is
+-- a plain EditBox wearing the game's input border (the atlases of Blizzard's
+-- InputBoxVisualTemplate), so no Blizzard template or script runs on it.
+local function PopupInput(row)
+	local box = row.input
+	if box then return box end
+	box = CreateFrame("EditBox", nil, row)
+	box.row = row
+	box:SetSize(POPUP_INPUT_W, 20)
+	box:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+	box:SetAutoFocus(false)
+	box:SetFontObject("GameFontHighlight")
+	box:SetJustifyH("CENTER")
+	box:SetTextInsets(2, 2, 0, 0)
+	local left = box:CreateTexture(nil, "BACKGROUND")
+	left:SetAtlas("common-search-border-left")
+	left:SetSize(8, 20)
+	left:SetPoint("LEFT")
+	local right = box:CreateTexture(nil, "BACKGROUND")
+	right:SetAtlas("common-search-border-right")
+	right:SetSize(8, 20)
+	right:SetPoint("RIGHT")
+	local middle = box:CreateTexture(nil, "BACKGROUND")
+	middle:SetAtlas("common-search-border-middle")
+	middle:SetPoint("TOPLEFT", left, "TOPRIGHT")
+	middle:SetPoint("BOTTOMRIGHT", right, "BOTTOMLEFT")
+	box.placeholder = box:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+	box.placeholder:SetPoint("CENTER")
+	-- the mouse can reach the box without crossing its label: resting on it
+	-- still closes a submenu opened from another entry
+	box:SetScript("OnEnter", function(self) PopupRowEnter(self.row) end)
+	box:SetScript("OnLeave", function(self) PopupRowLeave(self.row) end)
+	box:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
+	box:SetScript("OnEditFocusLost", function(self)
+		self:HighlightText(0, 0)
+		-- show what is in effect ("07" becomes 7, a cleared box the placeholder)
+		local node = self.row.node
+		if node and node.kind == "input" and node.get then self:SetText(node.get() or "") end
+		self.placeholder:SetShown(self:GetText() == "")
+	end)
+	box:SetScript("OnTextChanged", function(self, userInput)
+		self.placeholder:SetShown(self:GetText() == "")
+		if not userInput then return end
+		local node = self.row.node
+		if not (node and node.kind == "input" and node.enabled and node.set) then return end
+		node.set(self:GetText())
+		RefreshPopup()
+	end)
+	box:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+	box:SetScript("OnEscapePressed", function(self)
+		self:ClearFocus()
+		ClosePopup()
+	end)
+	-- the keyboard is never kept once the menu is gone
+	box:SetScript("OnHide", function(self) self:ClearFocus() end)
+	row.input = box
+	return box
+end
+
+-- Draws one entry; returns the width its content needs.
+local function FillPopupRow(row, node)
+	row.node = node
+	local kind = node.kind
+	row.tick:Hide()
+	row.mark:Hide()
+	row.arrow:Hide()
+	row.divider:Hide()
+	row.highlight:Hide()
+	if row.input and kind ~= "input" then row.input:Hide() end
+	if kind == "divider" then
+		row:SetHeight(POPUP_DIVIDER_H)
+		row.fontString:Hide()
+		row.divider:Show()
+		row:EnableMouse(false)
+		return 0
+	end
+	row:SetHeight(POPUP_ROW_H)
+	row:EnableMouse(kind ~= "title")
+	local font = "GameFontHighlight"
+	if kind == "title" then font = "GameFontNormal" elseif not node.enabled then font = "GameFontDisable" end
+	row.fontString:SetFontObject(font)
+	row.fontString:SetText(node.text or "")
+	row.fontString:ClearAllPoints()
+	row.fontString:Show()
+	local width = TextWidth(row.fontString)
+	if kind == "checkbox" or kind == "radio" then
+		local on = node.isSelected and node.isSelected(node.data)
+		row.tick:ClearAllPoints()
+		row.mark:ClearAllPoints()
+		if kind == "checkbox" then
+			row.tick:SetAtlas("common-dropdown-ticksquare", true)
+			row.tick:SetPoint("LEFT")
+			row.mark:SetAtlas("common-dropdown-icon-checkmark-yellow", true)
+			row.mark:SetPoint("CENTER", row.tick, "CENTER", 2, 1)
+			row.fontString:SetPoint("LEFT", row.tick, "RIGHT", 7, 1)
+			width = width + (row.tick:GetWidth() or 0) + 7
+		else
+			row.tick:SetAtlas("common-dropdown-tickradial", true)
+			row.tick:SetPoint("LEFT", -3, 0)
+			row.mark:SetAtlas("common-dropdown-icon-radialtick-yellow", true)
+			row.mark:SetPoint("TOPLEFT", row.tick, "TOPLEFT")
+			row.fontString:SetPoint("LEFT", row.tick, "RIGHT", 1, 0)
+			width = width + (row.tick:GetWidth() or 0) - 2
+		end
+		row.tick:Show()
+		row.mark:SetShown(on and true or false)
+	elseif kind == "input" then
+		local opts, box = node.opts, PopupInput(row)
+		row:SetHeight(POPUP_INPUT_H)
+		row.fontString:SetPoint("LEFT")
+		box:SetWidth(opts.width or POPUP_INPUT_W)
+		box:SetNumeric(opts.numeric and true or false)
+		box:SetMaxLetters(opts.maxLetters or 0)
+		box:SetEnabled(node.enabled)
+		box.placeholder:SetText(opts.placeholder or "")
+		-- a refresh while typing must not overwrite the typing
+		if not box:HasFocus() then box:SetText(node.get and node.get() or "") end
+		box.placeholder:SetShown(box:GetText() == "")
+		box:Show()
+		width = width + POPUP_INPUT_GAP + (opts.width or POPUP_INPUT_W)
+	else
+		row.fontString:SetPoint("LEFT")
+	end
+	if #node.children > 0 then
+		row.arrow:Show()
+		width = width + 16
+	end
+	for _, init in ipairs(node.inits) do init(row, node) end
+	return width
+end
+
+-- Lays out one panel: the root at the click, a submenu beside its row.
+local function RenderPopupPanel(level, node, anchorRow)
+	local panel = PopupPanel(level)
+	panel.node = node
+	local y, widest, count = -POPUP_INSET_T, 50, 0
+	for i, child in ipairs(node.children) do
+		local row = PopupRow(panel, i)
+		local width = FillPopupRow(row, child)
+		row.index = i
+		row:ClearAllPoints()
+		row:SetPoint("TOPLEFT", panel, "TOPLEFT", POPUP_INSET_L, y)
+		row:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -POPUP_INSET_R, y)
+		row:Show()
+		y = y - row:GetHeight()
+		if width > widest then widest = width end
+		count = i
+	end
+	for i = count + 1, #panel.rows do
+		panel.rows[i]:Hide()
+		panel.rows[i].node = nil
+	end
+	panel:SetSize(widest + POPUP_PAD_W + POPUP_INSET_L + POPUP_INSET_R, -y + POPUP_INSET_B)
+	panel:ClearAllPoints()
+	if anchorRow then
+		panel:SetPoint("TOPLEFT", anchorRow, "TOPRIGHT", POPUP_INSET_R + 10, POPUP_INSET_T)
+	else
+		panel:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", popup.x or 0, popup.y or 0)
+	end
+	panel:Show()
+	panel:Raise()
+	return panel
+end
+
+local function OpenPopupSubmenu(row)
+	local panel = row.panel
+	local level = panel.level
+	ClosePopupFrom(level + 2)
+	for l = level, #popup.openPath do popup.openPath[l] = nil end
+	popup.openPath[level] = row.index
+	RenderPopupPanel(level + 1, row.node, row)
+end
+
+function PopupRowEnter(row)
+	local node = row.node
+	if not node or node.kind == "title" or node.kind == "divider" then return end
+	if node.enabled and node.kind ~= "input" then row.highlight:Show() end
+	if #node.children > 0 then
+		OpenPopupSubmenu(row)
+	else
+		-- resting on a plain entry closes a submenu opened from this panel
+		local level = row.panel.level
+		ClosePopupFrom(level + 1)
+		for l = level, #popup.openPath do popup.openPath[l] = nil end
+	end
+end
+
+function PopupRowLeave(row)
+	row.highlight:Hide()
+end
+
+function PopupRowClick(row)
+	local node = row.node
+	if not node or not node.enabled or node.kind == "title" or node.kind == "divider" then return end
+	if #node.children > 0 then
+		OpenPopupSubmenu(row)
+		return
+	end
+	local kind = node.kind
+	if kind == "input" then
+		-- a click on the label types into the box
+		if row.input then row.input:SetFocus() end
+		return
+	end
+	if kind == "checkbox" and node.isSelected and node.isSelected(node.data) then
+		PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_OFF)
+	else
+		PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+	end
+	if kind == "checkbox" or kind == "radio" then
+		if node.setSelected then node.setSelected(node.data) end
+	elseif node.callback then
+		node.callback(node.data)
+	end
+	if node.response == REFRESH then RefreshPopup() else ClosePopup() end
+end
+
+-- Rebuilds every open panel from the generator, keeping open submenus open.
+function RefreshPopup()
+	if not popup.generator then return end
+	local root = NewPopupNode("root")
+	popup.generator(popup.owner, root)
+	local node, panel = root, RenderPopupPanel(1, root, nil)
+	for level = 1, #popup.openPath do
+		local child = node.children[popup.openPath[level]]
+		if not (child and #child.children > 0) then
+			ClosePopupFrom(level + 1)
+			for l = level, #popup.openPath do popup.openPath[l] = nil end
+			break
+		end
+		panel = RenderPopupPanel(level + 1, child, panel.rows[popup.openPath[level]])
+		node = child
+	end
+end
+
+function ClosePopup()
+	ClosePopupFrom(1)
+	popup.generator, popup.owner = nil, nil
+	wipe(popup.openPath)
+end
+
+local function PopupOpenFor(owner)
+	return popup.owner == owner and popup.panels[1] ~= nil and popup.panels[1]:IsShown()
+end
+
+-- Opens a menu at the cursor. `generator(owner, root)` fills it.
+local function OpenPopup(owner, generator)
+	ClosePopup()
+	popup.owner, popup.generator = owner, generator
+	local x, y = GetCursorPosition()
+	local scale = UIParent:GetEffectiveScale() or 1
+	popup.x, popup.y = x / scale, y / scale
+	PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+	RefreshPopup()
+	-- a menu never outlives what it belongs to (the window closing, a row
+	-- being recycled)
+	if owner and owner.HookScript and not hookedOwners[owner] then
+		hookedOwners[owner] = true
+		owner:HookScript("OnHide", function(self)
+			if popup.owner == self then ClosePopup() end
+		end)
+	end
+end
+NS.OpenPopup = OpenPopup
+
+-------------------------------------------------------------------------------
 -- Button badge and menu status
 -------------------------------------------------------------------------------
 
@@ -918,7 +1399,7 @@ end
 
 local function ShowRowMenu(row)
 	local entry = row.entry
-	MenuUtil.CreateContextMenu(row, function(owner, root)
+	NS.OpenPopup(row, function(owner, root)
 		root:CreateTitle(entry.name)
 		root:CreateButton(SEND_MESSAGE or "Send Message", function() OpenWhisperBox(entry.name) end)
 		local invite = root:CreateButton(GROUP_INVITE or "Group Invite", function() InviteEntry(entry) end)
@@ -1578,6 +2059,22 @@ local function ClearClasses()
 	Changed()
 end
 
+-- The lowest level a solo player may be (Arc, 2026-09-21: "I only want to see
+-- people level 18+ or 50+"), typed into the menu's Minimum level box ("I want
+-- this to be a user input"). Empty, 0 or 1 = any level.
+local function MinLevelText()
+	return minLevel and tostring(minLevel) or ""
+end
+
+local function SetMinLevel(text)
+	local level = tonumber(text)
+	level = (level and level > 1) and math.floor(level) or nil
+	if level == minLevel then return end -- "0" after empty, "07" after "7"
+	minLevel = level
+	Log("menu: player level " .. (minLevel and (minLevel .. "+") or "any"))
+	Changed()
+end
+
 local function IsGroupClassHidden(classFile)
 	return groupExclude[classFile] == true
 end
@@ -1594,15 +2091,30 @@ local function ClearGroupClasses()
 	Changed()
 end
 
--- Every class the game has (GetClassInfo, so Forever's own class list, never
--- retail's): the class lists always offer all of them, at 0 when nobody of a
--- class is listed right now (Arc, 2026-09-21: "always show all classes").
+-- Every class this game has: the class lists always offer all of them, at 0
+-- when nobody of a class is listed right now (Arc, 2026-09-21: "always show
+-- all classes"). The list is Blizzard's own CLASS_SORT_ORDER, which the game
+-- loads per game type (Forever's holds the nine classic classes). Counting
+-- GetClassInfo up to GetNumClasses() left Druid out: Forever answers 9, but
+-- class IDs have gaps and Druid is 11 (Arc: "when there is no druid available
+-- I still want the option"). The ID walk is only a fallback.
 local function GameClasses()
-	local list = {}
-	if GetNumClasses and GetClassInfo then
-		for i = 1, GetNumClasses() do
-			local _, classFile = GetClassInfo(i)
-			if classFile and not issecret(classFile) then list[#list + 1] = classFile end
+	local list, seen = {}, {}
+	local function Add(classFile)
+		if type(classFile) == "string" and not seen[classFile] then
+			seen[classFile] = true
+			list[#list + 1] = classFile
+		end
+	end
+	if type(CLASS_SORT_ORDER) == "table" then
+		for _, classFile in ipairs(CLASS_SORT_ORDER) do
+			if not issecret(classFile) then Add(classFile) end
+		end
+	end
+	if #list == 0 and GetClassInfo then
+		for classID = 1, 30 do -- no count to stop at: the IDs have gaps
+			local _, classFile = GetClassInfo(classID)
+			if not issecret(classFile) then Add(classFile) end
 		end
 	end
 	return list
@@ -1673,6 +2185,7 @@ local function ClearAll()
 	wipe(groupExclude)
 	showMode = "both"
 	openSpotOnly = false
+	minLevel = nil
 	Log("menu: reset filter")
 	Changed()
 end
@@ -1681,7 +2194,7 @@ local function BuildMenu(owner, root)
 	root:CreateTitle("Show")
 	for _, mode in ipairs(SHOW_MODES) do
 		local radio = root:CreateRadio(mode.label, IsShowMode, SetShowMode, mode.key)
-		radio:SetResponse(MenuResponse.Refresh) -- stay open, like the checkboxes
+		radio:SetResponse(REFRESH) -- stay open, like the checkboxes
 	end
 	root:CreateDivider()
 	root:CreateTitle("Players signed up as")
@@ -1691,8 +2204,11 @@ local function BuildMenu(owner, root)
 	-- Class submenu: combines with the role ticks (DPS + Mage = DPS mages).
 	local classMenu = root:CreateButton(AnyClassTicked() and ("Class: " .. ClassNames(classActive)) or "Class: any")
 	local anyClass = classMenu:CreateButton("Any class", ClearClasses)
-	anyClass:SetResponse(MenuResponse.Refresh)
+	anyClass:SetResponse(REFRESH)
 	AddClassBoxes(classMenu, false, classActive, IsClassOn, ToggleClass)
+	-- Typed minimum level; combines with the rest. Empty = any level.
+	root:CreateInput("Minimum level", MinLevelText, SetMinLevel,
+		{ numeric = true, maxLetters = 2, placeholder = "any" })
 	root:CreateDivider()
 	root:CreateTitle("Groups")
 	root:CreateCheckbox("Has a spot for me (" .. MyRolesText() .. ")", IsOpenSpotOn, ToggleOpenSpot)
@@ -1701,12 +2217,13 @@ local function BuildMenu(owner, root)
 	local groupMenu = root:CreateButton(AnyGroupExclusion()
 		and ("Hide groups with: " .. ClassNames(groupExclude)) or "Hide groups with: none")
 	local allGroups = groupMenu:CreateButton("Allow all classes", ClearGroupClasses)
-	allGroups:SetResponse(MenuResponse.Refresh)
+	allGroups:SetResponse(REFRESH)
 	AddClassBoxes(groupMenu, true, groupExclude, IsGroupClassHidden, ToggleGroupClass)
 	root:CreateDivider()
 	root:CreateTitle("Invites")
 	root:CreateCheckbox("Whisper when I invite", WhisperOn, ToggleWhisper)
 	root:CreateButton("Edit invite message", ShowSettings)
+	for _, extend in ipairs(NS.menuExtras) do extend(root) end
 	root:CreateDivider()
 	root:CreateButton("Reset filter", ClearAll)
 	-- Built at the widest text so it never truncates; the initializer re-runs
@@ -1734,6 +2251,7 @@ local function SummaryLines()
 	if showMode ~= "groups" then
 		if AnyRoleTicked() then lines[#lines + 1] = "Players signed up as: " .. ActiveNames() end
 		if AnyClassTicked() then lines[#lines + 1] = "Player classes: " .. ClassNames(classActive) end
+		if minLevel then lines[#lines + 1] = "Player level: " .. minLevel .. "+" end
 	end
 	if showMode ~= "players" then
 		if openSpotOnly then lines[#lines + 1] = "Groups with a spot for: " .. MyRolesText() end
@@ -1748,7 +2266,7 @@ local function ShowTooltip(button)
 	GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
 	GameTooltip:SetText("Advanced Filter", 1, 1, 1)
 	if not FilterActive() then
-		GameTooltip:AddLine("Filter the list by role and class, show only players or only groups, find groups with a spot for your role, or hide groups that have a class you don't want.", nil, nil, nil, true)
+		GameTooltip:AddLine("Filter players by role, class and level, show only players or only groups, find groups with a spot for your role, or hide groups that have a class you don't want.", nil, nil, nil, true)
 	else
 		for _, line in ipairs(SummaryLines()) do
 			GameTooltip:AddLine(line, 1, 0.82, 0, true)
@@ -1762,6 +2280,7 @@ local function ShowTooltip(button)
 	if WhisperOn() then
 		GameTooltip:AddLine("Invite whisper is on.", 0.25, 0.79, 0.95)
 	end
+	for _, add in ipairs(NS.tooltipExtras) do add(GameTooltip) end
 	GameTooltip:Show()
 end
 
@@ -1837,7 +2356,12 @@ local function Setup()
 	button:SetScript("OnMouseUp", function(self) self.Icon:SetPoint("CENTER", self, "CENTER", -1, 0) end)
 	button:SetScript("OnClick", function(self)
 		GameTooltip_Hide()
-		MenuUtil.CreateContextMenu(self, BuildMenu)
+		-- our own menu, never Blizzard's (see "Popup menus"); a second click closes it
+		if PopupOpenFor(self) then
+			ClosePopup()
+		else
+			NS.OpenPopup(self, BuildMenu)
+		end
 	end)
 	button:SetScript("OnEnter", ShowTooltip)
 	button:SetScript("OnLeave", GameTooltip_Hide)
@@ -1868,6 +2392,16 @@ end
 if C_PartyInfo and C_PartyInfo.InviteUnit then
 	hooksecurefunc(C_PartyInfo, "InviteUnit", OnInviteUnit)
 end
+
+-- The read-only API a companion addon uses (see NS.menuExtras at the top):
+-- judge a listing with the current filter, ask whether any player rule is
+-- set, whisper someone it just invited, and write to the debug log.
+NS.Verdict = Verdict
+NS.HasPlayerRules = HasPlayerRules
+NS.FilterSummary = FilterSummary
+NS.WhisperInvite = function(name) WhisperInvitee(name, true) end
+NS.ActivityName = ActivityName
+NS.Log = Log
 
 -- /arclfg          open the settings window (invite whisper)
 -- /arclfg debug    open the debug log

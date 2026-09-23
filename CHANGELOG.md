@@ -1,5 +1,17 @@
 # Arc LFG Filter changelog
 
+## 1.1.0
+
+### New Features
+- **Filter players by level** - Type a minimum level in the filter menu, for example 18 or 50, to show only players of that level or higher. Works together with the role and class filters.
+
+### Improvements
+- **Closing the filter menu** - Click the filter button again to close its menu.
+
+### Bug Fixes
+- **Druid missing from the class lists** - Both class lists now always include Druid, even when no druid is listed.
+- **Category menu error** - After using the filter menu, picking a category in the Looking For Group window could stop the search with an addon error. The filter menu is now drawn by the addon itself and no longer interferes with the game's own Category and Activity menus.
+
 ## 1.0.0
 
 First public release, for WoW Forever.
