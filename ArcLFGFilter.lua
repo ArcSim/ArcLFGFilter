@@ -12,8 +12,10 @@ local ADDON, NS = ...
 --   Groups      - "has a spot for me": groups with an open slot for a role
 --                 YOU are queued as (C_LFGListRoles.GetRoles, the same source
 --                 Blizzard uses to rank groups) via the *_REMAINING counts;
---                 plus "Hide groups with": drop any group that has a member
---                 of a ticked class (every member is read)
+--                 "Open spot for": the same test against roles you pick, ANY
+--                 ticked role is enough; "Already has": the group must hold
+--                 EVERY ticked role; plus "Hide groups with": drop any group
+--                 that has a member of a ticked class (every member is read)
 -- Nothing set = nothing changes (default OFF). Your own listing always stays.
 --
 -- HOW (v6, 2026-09-21): BLIZZARD'S LIST IS NEVER TOUCHED. While a filter is
@@ -91,12 +93,15 @@ local WHISPER_REPEAT   = 60          -- seconds before the same player is whispe
 -- Blizzard_LFGVanilla_Browse.xml): 48px rows, 36px category headers, names
 -- capped at 228px, and Blizzard's role display template on the right.
 local ROW_H, HEADER_H, NAME_MAX = 48, 36, 228
+local NO_MATCH_NOTE = "No listings match your filter."
 local DISPLAY_TEMPLATE = "LFGVanillaListGroupDataDisplayTemplate"
 local DELISTED_COLOR   = { r = 0.3, g = 0.3, b = 0.3 }
 
 local active = {}                   -- [role key] = true while that role is ticked
 local classActive = {}              -- [classFile] = true while that class is ticked
 local groupExclude = {}             -- [classFile] = true: hide groups with that class in them
+local groupNeeds = {}               -- [role key] = true: group must have an open spot for it
+local groupHas = {}                 -- [role key] = true: group must already have that role
 local minLevel                      -- nil, or the lowest level a solo player may be
 local showMode = "both"             -- "both", "players" or "groups"
 local openSpotOnly = false          -- groups: only those with a slot for my role
@@ -167,9 +172,17 @@ local function AnyGroupExclusion()
 	return next(groupExclude) ~= nil
 end
 
+local function AnyGroupNeeds()
+	return next(groupNeeds) ~= nil
+end
+
+local function AnyGroupHas()
+	return next(groupHas) ~= nil
+end
+
 local function FilterActive()
 	return showMode ~= "both" or openSpotOnly or AnyRoleTicked() or AnyClassTicked() or AnyGroupExclusion()
-		or minLevel ~= nil
+		or minLevel ~= nil or AnyGroupNeeds() or AnyGroupHas()
 end
 
 -- A rule about which PLAYERS match (role, class or level), as opposed to the
@@ -178,12 +191,17 @@ local function HasPlayerRules()
 	return (AnyRoleTicked() or AnyClassTicked() or minLevel ~= nil) and true or false
 end
 
-local function ActiveNames()
+-- The roles in a set (active, groupNeeds, groupHas), in Tank/Healer/DPS order.
+local function RoleNames(set)
 	local names = {}
 	for _, role in ipairs(ROLES) do
-		if active[role.key] then names[#names + 1] = role.label end
+		if set[role.key] then names[#names + 1] = role.label end
 	end
 	return table.concat(names, ", ")
+end
+
+local function ActiveNames()
+	return RoleNames(active)
 end
 
 -- Blizzard's class order (CLASS_SORT_ORDER) where it has the class, else by name.
@@ -248,6 +266,8 @@ local function FilterSummary()
 	end
 	if showMode ~= "players" then
 		if openSpotOnly then parts[#parts + 1] = "groups: spot for " .. MyRolesText() end
+		if AnyGroupNeeds() then parts[#parts + 1] = "groups needing: " .. RoleNames(groupNeeds) end
+		if AnyGroupHas() then parts[#parts + 1] = "groups with: " .. RoleNames(groupHas) end
 		if AnyGroupExclusion() then parts[#parts + 1] = "groups without: " .. ClassNames(groupExclude) end
 	end
 	if #parts == 0 then return "none" end
@@ -316,23 +336,55 @@ local function Verdict(resultID)
 			end
 		end
 	end
-	if not openSpotOnly then return true end
-	local mine = MyRoles()
-	if not mine then return nil end
+	if not (openSpotOnly or AnyGroupNeeds() or AnyGroupHas()) then return true end
+	-- The role counts Blizzard ranks groups with: TANK/HEALER/DAMAGER = who is
+	-- in the group, <ROLE>_REMAINING = the open slots left. A missing count
+	-- cannot judge, so it keeps the group.
 	local counts = C_LFGList.GetSearchResultMemberCounts(resultID)
 	if not counts then return true end
 	if issecret(counts) then return nil end
-	for _, role in ipairs(ROLES) do
-		local wanted = mine[role.solo]
-		if issecret(wanted) then return nil end
-		if wanted then
-			local open = counts[role.key .. "_REMAINING"]
-			if issecret(open) then return nil end
-			if open == nil then return true end -- count missing: can't judge, keep
-			if open > 0 then return true end
+
+	-- "Already has": EVERY ticked role must be in the group already
+	if AnyGroupHas() then
+		for _, role in ipairs(ROLES) do
+			if groupHas[role.key] then
+				local have = counts[role.key]
+				if issecret(have) then return nil end
+				if have ~= nil and have <= 0 then return false end
+			end
 		end
 	end
-	return false
+
+	-- "Open spot for": an open slot for ANY ticked role is enough
+	if AnyGroupNeeds() then
+		local found = false
+		for _, role in ipairs(ROLES) do
+			if groupNeeds[role.key] then
+				local open = counts[role.key .. "_REMAINING"]
+				if issecret(open) then return nil end
+				if open == nil or open > 0 then found = true end
+			end
+		end
+		if not found then return false end
+	end
+
+	-- "Has a spot for me": the same test against the roles YOU are queued as
+	if openSpotOnly then
+		local mine = MyRoles()
+		if not mine then return nil end
+		local found = false
+		for _, role in ipairs(ROLES) do
+			local wanted = mine[role.solo]
+			if issecret(wanted) then return nil end
+			if wanted then
+				local open = counts[role.key .. "_REMAINING"]
+				if issecret(open) then return nil end
+				if open == nil or open > 0 then found = true end
+			end
+		end
+		if not found then return false end
+	end
+	return true
 end
 
 -------------------------------------------------------------------------------
@@ -369,6 +421,32 @@ local function MessageTemplate()
 	return text
 end
 
+-- Quick messages: ready-made lines for the Send Message box (Arc, 2026-09-28:
+-- "premade messages that I can edit, default should say like Level X Class
+-- Here"). One table, not a pile of file locals - this file sits near Lua's
+-- 200-local ceiling. Slot 1 falls back to the default; the others are empty
+-- until you write one.
+local QM = {
+	SLOTS = 3,
+	DEFAULT = "Level {level} {class} here, can I join?",
+}
+
+function QM.Text(i)
+	local saved = db and db.quickMessages and db.quickMessages[i]
+	if type(saved) == "string" and saved ~= "" then return saved end
+	if i == 1 then return QM.DEFAULT end
+	return nil
+end
+
+function QM.Set(i, text)
+	if not db then return end
+	text = (text or ""):match("^%s*(.-)%s*$")
+	if i == 1 and text == QM.DEFAULT then text = "" end
+	db.quickMessages = db.quickMessages or {}
+	db.quickMessages[i] = (text ~= "") and text or nil
+	if not next(db.quickMessages) then db.quickMessages = nil end
+end
+
 -- Runs once this addon's saved file has had its chance to load.
 local function LoadSettings()
 	local found = type(ArcLFGFilterDB) == "table"
@@ -403,11 +481,26 @@ end
 
 -- Fills {dungeon} and {name} (any case; anything else in braces stays as
 -- typed), then makes the result chat-safe.
+-- Your own level and class, the two tokens the ready-made lines add.
+function QM.MyLevel()
+	local level = UnitLevel and UnitLevel("player")
+	if issecret(level) or type(level) ~= "number" or level <= 0 then return nil end
+	return level
+end
+
+function QM.MyClass()
+	local name = UnitClass and UnitClass("player")
+	if issecret(name) or type(name) ~= "string" or name == "" then return nil end
+	return name
+end
+
 local function BuildMessage(template, dungeon, name)
 	local text = template:gsub("{(%a+)}", function(key)
 		key = key:lower()
 		if key == "dungeon" then return dungeon end
 		if key == "name" then return name end
+		if key == "level" then local l = QM.MyLevel() return l and tostring(l) or nil end
+		if key == "class" then return QM.MyClass() end
 	end)
 	return ChatSafe(text)
 end
@@ -739,6 +832,18 @@ local function ShowPanel()
 	RefreshPanel()
 end
 
+-- The whisper queue lives in one table, not twenty file locals: this file
+-- sits near Lua's 200-local ceiling. `items` is the queue (newest first),
+-- `mode` is true while the Whispers tab is the one showing. Its functions are
+-- filled in two blocks below: the collector after the whisper box, the tab UI
+-- next to the list it shares a panel with.
+local WQ = {
+	items = {},
+	rows = {},
+	MAX = 25,
+	ROW_H = 46,
+}
+
 -------------------------------------------------------------------------------
 -- Settings window (Arc theme: ALF_Theme.lua)
 -------------------------------------------------------------------------------
@@ -758,7 +863,7 @@ local function BuildSettings()
 	local win = AT.CreateWindow("ArcLFGFilterSettings", {
 		title = "|cff3fc9f2Arc|r|cffd5e2f2 LFG Filter|r",
 		version = C_AddOns.GetAddOnMetadata(ADDON, "Version"),
-		w = 460, h = 290, minW = 400, minH = 270,
+		w = 470, h = 500, minW = 420, minH = 440,
 	})
 	local pg = AT.NewPage(win)
 	pg:SetPoint("TOPLEFT", win, "TOPLEFT", 10, -40)
@@ -802,6 +907,23 @@ local function BuildSettings()
 
 	AT.RowDesc(pg, "{dungeon} becomes the dungeon and {name} the player's first name.")
 
+	AT.Section(pg, "Whisper queue")
+	AT.RowToggle(pg, "Collect whispers while my group is listed", WQ.On, function(on)
+		if on ~= WQ.On() then WQ.Toggle() end
+	end, nil, "Adds a Whispers tab to the Looking For Group window: everyone who whispers you while your group is listed, with their class and an Invite button. Off until you turn it on.")
+
+	AT.Section(pg, "Quick messages")
+	for i = 1, QM.SLOTS do
+		local row = AT.RowInput(pg, "Message " .. i, function() return QM.Text(i) or "" end,
+			function(text)
+				QM.Set(i, text)
+				RefreshSettings()
+			end, nil, nil, i == 1 and QM.DEFAULT or "Empty", true)
+		row._colFill = true
+		row._colCtrl:SetMaxLetters(MAX_TEMPLATE)
+	end
+	AT.RowDesc(pg, "These sit as buttons in the Send Message box. {level} and {class} become yours, {name} the player's first name and {dungeon} the dungeon.", 32)
+
 	AT.AddDiscordFooter(win, "ArcLFGFilterDiscordCopy")
 	-- CreateWindow owns OnShow via SetScript: hook it, never replace it
 	win:HookScript("OnShow", function() AT.LayoutPage(pg) end)
@@ -822,6 +944,22 @@ end
 -- trap as the list), so the message is typed here and sent as a whisper.
 -------------------------------------------------------------------------------
 
+-- A button's label: the message it will write, cut on a letter boundary.
+local function Shorten(text, max)
+	if #text <= max then return text end
+	local cut = max
+	while cut > 0 and (text:byte(cut + 1) or 0) >= 128 and (text:byte(cut + 1) or 0) < 192 do cut = cut - 1 end
+	return text:sub(1, cut) .. "..."
+end
+
+-- The dungeon a quick message means for the player the box is open on: their
+-- own listing first, then the usual preview fallback.
+local function QuickDungeon(name)
+	local info = SoloListingOf(name)
+	local dungeon = info and DungeonFor(info.activityIDs)
+	return dungeon or PreviewDungeon()
+end
+
 local function OpenWhisperBox(name)
 	if not name then return end
 	local AT = NS.AT
@@ -829,7 +967,7 @@ local function OpenWhisperBox(name)
 	if not whisperBox then
 		local win = AT.CreateWindow("ArcLFGFilterWhisper", {
 			title = "|cff3fc9f2Arc|r|cffd5e2f2 Send Message|r",
-			w = 380, h = 116, minW = 380, minH = 116, resizable = false,
+			w = 380, h = 152, minW = 380, minH = 152, resizable = false,
 		})
 		local label = win:CreateFontString(nil, "OVERLAY")
 		label:SetFont(STANDARD_TEXT_FONT, 12, "")
@@ -874,15 +1012,177 @@ local function OpenWhisperBox(name)
 		box:SetScript("OnEscapePressed", function() win:Hide() end)
 		send:SetScript("OnClick", Send)
 		win:HookScript("OnHide", function() box:ClearFocus() end)
-		win.Label, win.Box, win.Hint = label, box, hint
+
+		-- ready-made messages, written in the settings window
+		local quick = {}
+		for i = 1, QM.SLOTS do
+			local b = AT.MakeSmallButton(win, "", 112)
+			if i == 1 then
+				b:SetPoint("BOTTOMLEFT", 12, 12)
+			else
+				b:SetPoint("LEFT", quick[i - 1], "RIGHT", 6, 0)
+			end
+			b:SetScript("OnClick", function()
+				local template = QM.Text(i)
+				if not template then return end
+				box:SetText(BuildMessage(template, QuickDungeon(win.target), FirstName(win.target)))
+				box:SetFocus()
+				box:SetCursorPosition(#(box:GetText() or ""))
+			end)
+			quick[i] = b
+		end
+		win.Label, win.Box, win.Hint, win.Quick = label, box, hint, quick
 		whisperBox = win
 	end
 	whisperBox.target = name
 	whisperBox.Label:SetText("To " .. name)
 	whisperBox.Hint:SetText("Enter sends, Esc closes.")
+	for i, button in ipairs(whisperBox.Quick) do
+		local template = QM.Text(i)
+		button:SetShown(template ~= nil)
+		if template then
+			button.fs:SetText(Shorten(BuildMessage(template, QuickDungeon(name), FirstName(name)), 15))
+		end
+	end
 	whisperBox:Show()
 	whisperBox.Box:SetFocus()
 end
+
+-------------------------------------------------------------------------------
+-- Whisper queue: who whispered you while your group is listed
+-------------------------------------------------------------------------------
+-- Arc, 2026-09-28: "when you queue your group you get bombarded with whispers
+-- ... a whispered queue where it shows the class of the person that whispered
+-- and the message, and an easy button to invite".
+--
+-- CHAT_MSG_WHISPER carries the text, the sender's name and their GUID, and
+-- GetPlayerInfoByGUID turns that GUID into their class - listed or not. Level
+-- and roles come from their own listing when they have one. The event is
+-- `SecretInChatMessagingLockdown`, so in lockdown nothing is collected at all:
+-- a secret would be unusable (no invite, no class) and must never be stored.
+-- Default OFF; the queue lives in a tab over Blizzard's list, built below.
+
+function WQ.On()
+	return (db and db.whisperQueue == true) and true or false
+end
+
+function WQ.SetOn(on)
+	if not db then return end
+	db.whisperQueue = on and true or nil
+	Log("whisper queue -> " .. (on and "ON" or "off"))
+end
+
+-- Only while you are actually recruiting.
+function WQ.ListingActive()
+	local mine = C_LFGList.GetActiveEntryInfo()
+	return (mine ~= nil and not issecret(mine)) and true or false
+end
+
+function WQ.ClassFromGUID(guid)
+	if not (guid and GetPlayerInfoByGUID) or issecret(guid) then return nil end
+	local localized, classFile = GetPlayerInfoByGUID(guid)
+	if issecret(classFile) then classFile = nil end
+	if issecret(localized) then localized = nil end
+	return classFile, localized
+end
+
+function WQ.Find(name)
+	for i, entry in ipairs(WQ.items) do
+		if entry.name == name then return entry, i end
+	end
+end
+
+function WQ.Add(name, text, guid)
+	if not WQ.On() then return end
+	if issecret(name) or issecret(text) or type(name) ~= "string" or type(text) ~= "string" then return end
+	if LockState() ~= "no" then return end   -- never store a secret
+	if not WQ.ListingActive() then return end
+	local classFile, className = WQ.ClassFromGUID(guid)
+	local level, roles
+	-- their own listing, when they have one, adds level and the roles they
+	-- signed up as
+	local info = SoloListingOf(name)
+	local id = info and Plain(info.searchResultID)
+	local member = id and C_LFGList.GetSearchResultPlayerInfo(id, 1)
+	local area
+	if member and not issecret(member) then
+		level = Plain(member.level)
+		area = Plain(member.areaName)
+		classFile = classFile or Plain(member.classFilename)
+		local signed = member.lfgRoles
+		if signed and not issecret(signed) then
+			roles = {}
+			for _, role in ipairs(ROLES) do
+				local on = signed[role.solo]
+				roles[role.solo] = (not issecret(on) and on) and true or false
+			end
+		end
+	end
+	-- not listed but on your friends list: that carries their zone too.
+	-- (/who is not an option: C_FriendList.SendWho is HasRestrictions, so an
+	-- addon cannot ask the server where a stranger is.)
+	if not area and C_FriendList and C_FriendList.GetFriendInfo then
+		local friend = C_FriendList.GetFriendInfo(name)
+		if friend and not issecret(friend) then area = Plain(friend.area) end
+	end
+	-- the same player whispering again moves back to the top and keeps the
+	-- rest of what we know about them
+	local entry, at = WQ.Find(name)
+	if entry then
+		table.remove(WQ.items, at)
+	else
+		entry = { name = name }
+	end
+	entry.text, entry.at = text, GetTime()
+	entry.classFile, entry.className = classFile or entry.classFile, className or entry.className
+	entry.level, entry.roles = level or entry.level, roles or entry.roles
+	entry.area = area or entry.area
+	table.insert(WQ.items, 1, entry)
+	while #WQ.items > WQ.MAX do table.remove(WQ.items) end
+	Log("whisper queue: " .. name .. (entry.classFile and (" (" .. entry.classFile .. ")") or ""))
+	if WQ.Refresh then WQ.Refresh() end
+end
+
+-- Recruiting is over, so the queue is stale (Arc, 2026-09-28: "once the group
+-- is full and it is not in the LFG, clear the whisper queue").
+function WQ.PartyFull()
+	if not IsInGroup() or (IsInRaid and IsInRaid()) then return false end
+	local size = GetNumGroupMembers and GetNumGroupMembers()
+	if issecret(size) or type(size) ~= "number" then return false end
+	return size >= 5
+end
+
+function WQ.Clear(why)
+	if #WQ.items == 0 then return end
+	wipe(WQ.items)
+	Log("whisper queue: cleared - " .. why)
+	if WQ.Refresh then WQ.Refresh() end
+end
+
+function WQ.Drop(entry)
+	local _, at = WQ.Find(entry and entry.name or "")
+	if not at then return end
+	table.remove(WQ.items, at)
+	Log("whisper queue: dismissed " .. entry.name)
+	if WQ.Refresh then WQ.Refresh() end
+end
+
+WQ.chat = CreateFrame("Frame")
+for _, event in ipairs({ "CHAT_MSG_WHISPER", "LFG_LIST_ACTIVE_ENTRY_UPDATE", "GROUP_ROSTER_UPDATE" }) do
+	if not (C_EventUtils and C_EventUtils.IsEventValid) or C_EventUtils.IsEventValid(event) then
+		WQ.chat:RegisterEvent(event)
+	end
+end
+WQ.chat:SetScript("OnEvent", function(_, event, text, playerName, languageName, channelName, playerName2,
+	specialFlags, zoneChannelID, channelIndex, channelBaseName, languageID, lineID, guid)
+	if event == "CHAT_MSG_WHISPER" then
+		WQ.Add(playerName, text, guid)
+	elseif not WQ.ListingActive() then
+		WQ.Clear("your group is no longer listed")
+	elseif WQ.PartyFull() then
+		WQ.Clear("your group is full")
+	end
+end)
 
 -------------------------------------------------------------------------------
 -- Popup menus: this addon's own, drawn with Forever's menu art
@@ -1791,7 +2091,9 @@ end
 
 local function FillHeader(header, category)
 	header.category = category
-	if category == "players" then
+	if category == "whispers" then
+		header.Label:SetText("Whispers (" .. #WQ.items .. ")")
+	elseif category == "players" then
 		header.Label:SetText(LFG_LIST_CATEGORY_SOLO_PLAYERS or "Players")
 	else
 		header.Label:SetText(LFG_LIST_CATEGORY_GROUPS or "Groups")
@@ -1825,6 +2127,33 @@ local function LayoutView(kept)
 		frame:Show()
 		y = y + height
 	end
+
+	-- The whisper queue rides above the listings as a third section, in the
+	-- same collapsible shape as Players and Groups (Arc, 2026-09-28: "like
+	-- the same drop down for groups and players, but the Whisper queue").
+	local queued = WQ.On() and #WQ.items > 0
+	local shownWhispers = 0
+	if queued then
+		headerCount = headerCount + 1
+		local header = viewHeaders[headerCount] or NewHeader()
+		viewHeaders[headerCount] = header
+		FillHeader(header, "whispers")
+		Place(header, HEADER_H)
+		if not collapsed.whispers then
+			for i, entry in ipairs(WQ.items) do
+				local row = WQ.rows[i] or WQ.NewRow()
+				WQ.rows[i] = row
+				WQ.FillRow(row, entry)
+				Place(row, WQ.ROW_H)
+				shownWhispers = i
+			end
+		end
+	end
+	for i = shownWhispers + 1, #WQ.rows do
+		WQ.rows[i]:Hide()
+		WQ.rows[i].entry = nil
+	end
+
 	for _, id in ipairs(kept) do
 		-- Verdict keeps a listing it has no info for (it cannot judge one);
 		-- there is nothing to draw for it either
@@ -1863,7 +2192,7 @@ local function LayoutView(kept)
 	PlaceScroll(needBar)
 	content:SetHeight(math.max(1, y))
 	content:SetWidth(math.max(1, (view:GetWidth() or 0) - (needBar and 21 or 5)))
-	view.Note:SetShown(#kept == 0)
+	view.Note:SetShown(#kept == 0 and not queued)
 	PaintSelection()
 	UpdateViewButtons()
 end
@@ -1879,7 +2208,9 @@ function RebuildView()
 	rebuildQueued = false
 	local frame = LFGBrowseFrame
 	if not (view and frame) then return end
-	if not FilterActive() then
+	-- our list also earns its place when the whisper queue has something to
+	-- show, filter or no filter
+	if not (FilterActive() or (WQ.On() and #WQ.items > 0)) then
 		pausedReason = nil
 		HideView()
 		return
@@ -1897,7 +2228,7 @@ function RebuildView()
 	end
 	local n = #results
 	totalCount = n
-	if n == 0 then
+	if n == 0 and not (WQ.On() and #WQ.items > 0) then
 		pausedReason, shownCount = nil, 0
 		HideView()
 		return
@@ -1980,12 +2311,19 @@ local function BuildView(frame)
 
 	local note = v:CreateFontString(nil, "OVERLAY", "GameFontDisable")
 	note:SetPoint("TOP", 0, -40)
-	note:SetText("No listings match your filter.")
+	note:SetText(NO_MATCH_NOTE)
 	v.Note = note
 
 	-- our Send Message / Group Invite, exactly over Blizzard's (which only
-	-- ever act on Blizzard's own selection)
+	-- ever act on Blizzard's own selection). Blizzard's pair overlaps the
+	-- bottom of the Inset by a few pixels (buttons at y 16..44, the inset
+	-- floor at 37), and our rows live two levels above this frame (scroll ->
+	-- content -> row), so without a level of their own the buttons end up
+	-- UNDER the list (Arc, 2026-09-28: "the send message and group invite
+	-- button is behind our panels").
+	local buttonLevel = v:GetFrameLevel() + 10
 	local send = CreateFrame("Button", nil, v, "UIPanelButtonTemplate")
+	send:SetFrameLevel(buttonLevel)
 	send:SetAllPoints(frame.SendMessageButton)
 	send:SetText(SEND_MESSAGE or "Send Message")
 	send:SetScript("OnClick", function()
@@ -1993,6 +2331,7 @@ local function BuildView(frame)
 		if entry then OpenWhisperBox(entry.name) end
 	end)
 	local invite = CreateFrame("Button", nil, v, "UIPanelButtonTemplate")
+	invite:SetFrameLevel(buttonLevel)
 	invite:SetAllPoints(frame.GroupInviteButton)
 	invite:SetText(GROUP_INVITE or "Group Invite")
 	invite:SetScript("OnClick", function() InviteEntry(SelectedEntry()) end)
@@ -2001,6 +2340,136 @@ local function BuildView(frame)
 	v.hasDisplay = not (C_XMLUtil and C_XMLUtil.GetTemplateInfo)
 		or C_XMLUtil.GetTemplateInfo(DISPLAY_TEMPLATE) ~= nil
 	UpdateViewButtons()
+end
+
+-------------------------------------------------------------------------------
+-- The Whispers section: the queue's rows, drawn by LayoutView above the
+-- Players and Groups sections and collapsed by the same header
+-------------------------------------------------------------------------------
+
+function WQ.TimeAgo(at)
+	local secs = GetTime() - (at or 0)
+	if secs < 60 then return "just now" end
+	if secs < 3600 then return math.floor(secs / 60) .. "m ago" end
+	return math.floor(secs / 3600) .. "h ago"
+end
+
+-- Where they were when they whispered, and whether that is where you are
+-- (Arc, 2026-09-28: "the current location of the people that whisper me, and
+-- see if we can say close by or not"). Their zone comes from their own
+-- listing, or from your friends list when they are on it.
+function WQ.MyZone()
+	local zone = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText())
+	if issecret(zone) or type(zone) ~= "string" or zone == "" then return nil end
+	return zone
+end
+
+function WQ.AreaText(area)
+	if type(area) ~= "string" or area == "" then return nil end
+	if area == WQ.MyZone() then return "|cff40dd5a" .. area .. " (here)|r" end
+	return area
+end
+
+function WQ.RoleIcons(roles)
+	if type(roles) ~= "table" then return nil end
+	local out = {}
+	for _, role in ipairs(ROLES) do
+		if roles[role.solo] then out[#out + 1] = Icon(ROLE_ATLAS[role.key]) end
+	end
+	if #out == 0 then return nil end
+	return table.concat(out, " ")
+end
+
+-- name + what we know about them on the first line, their message on the
+-- second, Reply / Invite and a dismiss x on the right
+function WQ.NewRow()
+	local row = CreateFrame("Frame", nil, view.Content)
+	row:SetHeight(WQ.ROW_H)
+	row.Name = row:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+	row.Name:SetPoint("TOPLEFT", 10, -7)
+	row.Meta = row:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+	row.Meta:SetPoint("LEFT", row.Name, "RIGHT", 8, 0)
+	row.Text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	row.Text:SetPoint("BOTTOMLEFT", 10, 9)
+	row.Text:SetJustifyH("LEFT")
+	row.Text:SetWordWrap(false)
+
+	local invite = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+	invite:SetSize(64, 20)
+	invite:SetPoint("BOTTOMRIGHT", -8, 6)
+	invite:SetText(INVITE or "Invite")
+	invite:SetScript("OnClick", function()
+		local entry = row.entry
+		if not entry then return end
+		entry.invited = true
+		Log("whisper queue: invited " .. entry.name)
+		C_PartyInfo.InviteUnit(entry.name)
+		WQ.Refresh()
+	end)
+	local reply = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+	reply:SetSize(58, 20)
+	reply:SetPoint("RIGHT", invite, "LEFT", -4, 0)
+	reply:SetText("Reply")
+	reply:SetScript("OnClick", function()
+		if row.entry then OpenWhisperBox(row.entry.name) end
+	end)
+	row.Text:SetPoint("RIGHT", reply, "LEFT", -8, 0)
+
+	local dismiss = CreateFrame("Button", nil, row)
+	dismiss:SetSize(16, 16)
+	dismiss:SetPoint("TOPRIGHT", -8, -5)
+	local x = dismiss:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+	x:SetPoint("CENTER")
+	x:SetText("x")
+	dismiss:SetScript("OnEnter", function() x:SetTextColor(1, 0.82, 0) end)
+	dismiss:SetScript("OnLeave", function() x:SetTextColor(0.5, 0.5, 0.5) end)
+	dismiss:SetScript("OnClick", function() WQ.Drop(row.entry) end)
+
+	local line = row:CreateTexture(nil, "ARTWORK")
+	line:SetColorTexture(1, 1, 1, 0.06)
+	line:SetPoint("BOTTOMLEFT", 6, 0)
+	line:SetPoint("BOTTOMRIGHT", -6, 0)
+	line:SetHeight(1)
+
+	row.InviteButton, row.ReplyButton, row.DismissButton = invite, reply, dismiss
+	return row
+end
+
+function WQ.FillRow(row, entry)
+	row.entry = entry
+	local color = entry.classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[entry.classFile]
+	row.Name:SetText(entry.name)
+	if color then
+		row.Name:SetTextColor(color.r, color.g, color.b)
+	else
+		row.Name:SetTextColor(1, 1, 1)
+	end
+	local bits = {}
+	if entry.level then bits[#bits + 1] = (LEVEL_ABBR or "Lvl") .. " " .. entry.level end
+	if entry.className then bits[#bits + 1] = entry.className end
+	local icons = WQ.RoleIcons(entry.roles)
+	if icons then bits[#bits + 1] = icons end
+	local where = WQ.AreaText(entry.area)
+	if where then bits[#bits + 1] = where end
+	bits[#bits + 1] = WQ.TimeAgo(entry.at)
+	if entry.invited then bits[#bits + 1] = "invited" end
+	row.Meta:SetText(table.concat(bits, "   "))
+	row.Text:SetText(entry.text)
+	row.InviteButton:SetEnabled(not entry.invited)
+	row:Show()
+end
+
+
+
+-- A whisper arriving or being answered redraws the list, coalesced.
+function WQ.Refresh()
+	RequestRebuild()
+end
+
+function WQ.Toggle()
+	WQ.SetOn(not WQ.On())
+	RebuildView()
+	RefreshSettings()
 end
 
 -------------------------------------------------------------------------------
@@ -2073,6 +2542,48 @@ local function SetMinLevel(text)
 	minLevel = level
 	Log("menu: player level " .. (minLevel and (minLevel .. "+") or "any"))
 	Changed()
+end
+
+-- Which roles a group must still have room for, and which it must already
+-- have. Both read Blizzard's own member counts, the same source as "has a
+-- spot for me" (Arc, 2026-09-23).
+local function IsGroupNeed(key)
+	return groupNeeds[key] == true
+end
+
+local function ToggleGroupNeed(key)
+	groupNeeds[key] = not groupNeeds[key] or nil
+	Log("menu: groups with an open spot for " .. key .. " -> " .. (groupNeeds[key] and "ON" or "off"))
+	Changed()
+end
+
+local function ClearGroupNeeds()
+	wipe(groupNeeds)
+	Log("menu: groups with an open spot for any role")
+	Changed()
+end
+
+local function IsGroupHas(key)
+	return groupHas[key] == true
+end
+
+local function ToggleGroupHas(key)
+	groupHas[key] = not groupHas[key] or nil
+	Log("menu: groups that already have " .. key .. " -> " .. (groupHas[key] and "ON" or "off"))
+	Changed()
+end
+
+local function ClearGroupHas()
+	wipe(groupHas)
+	Log("menu: groups with anyone in them")
+	Changed()
+end
+
+-- Tank / Healer / DPS checkboxes wearing Blizzard's role icons.
+local function AddRoleBoxes(menu, isOn, toggle)
+	for _, role in ipairs(ROLES) do
+		menu:CreateCheckbox(Icon(ROLE_ATLAS[role.key]) .. " " .. role.label, isOn, toggle, role.key)
+	end
 end
 
 local function IsGroupClassHidden(classFile)
@@ -2175,6 +2686,9 @@ local function AddClassBoxes(menu, forGroups, ticked, isOn, toggle)
 		local label = ClassLabel(classFile)
 		local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile]
 		if color and color.colorStr then label = "|c" .. color.colorStr .. label .. "|r" end
+		-- the class icon Blizzard draws on its own listings, when it has one
+		local atlas = "groupfinder-icon-class-" .. classFile:lower()
+		if C_Texture.GetAtlasInfo(atlas) then label = Icon(atlas) .. " " .. label end
 		menu:CreateCheckbox(string.format("%s (%d)", label, counts[classFile]), isOn, toggle, classFile)
 	end
 end
@@ -2183,6 +2697,8 @@ local function ClearAll()
 	wipe(active)
 	wipe(classActive)
 	wipe(groupExclude)
+	wipe(groupNeeds)
+	wipe(groupHas)
 	showMode = "both"
 	openSpotOnly = false
 	minLevel = nil
@@ -2198,9 +2714,7 @@ local function BuildMenu(owner, root)
 	end
 	root:CreateDivider()
 	root:CreateTitle("Players signed up as")
-	for _, role in ipairs(ROLES) do
-		root:CreateCheckbox(role.label, IsRoleOn, ToggleRole, role.key)
-	end
+	AddRoleBoxes(root, IsRoleOn, ToggleRole)
 	-- Class submenu: combines with the role ticks (DPS + Mage = DPS mages).
 	local classMenu = root:CreateButton(AnyClassTicked() and ("Class: " .. ClassNames(classActive)) or "Class: any")
 	local anyClass = classMenu:CreateButton("Any class", ClearClasses)
@@ -2212,6 +2726,19 @@ local function BuildMenu(owner, root)
 	root:CreateDivider()
 	root:CreateTitle("Groups")
 	root:CreateCheckbox("Has a spot for me (" .. MyRolesText() .. ")", IsOpenSpotOn, ToggleOpenSpot)
+	-- Which roles a group still has room for: an open slot for ANY ticked role
+	-- keeps it (Arc, 2026-09-23: "add a couple more options for groups").
+	local needsMenu = root:CreateButton(AnyGroupNeeds()
+		and ("Open spot for: " .. RoleNames(groupNeeds)) or "Open spot for: any")
+	local anyNeed = needsMenu:CreateButton("Any role", ClearGroupNeeds)
+	anyNeed:SetResponse(REFRESH)
+	AddRoleBoxes(needsMenu, IsGroupNeed, ToggleGroupNeed)
+	-- Which roles a group must already have: EVERY ticked role must be there
+	local hasMenu = root:CreateButton(AnyGroupHas()
+		and ("Already has: " .. RoleNames(groupHas)) or "Already has: anyone")
+	local anyHas = hasMenu:CreateButton("Anyone", ClearGroupHas)
+	anyHas:SetResponse(REFRESH)
+	AddRoleBoxes(hasMenu, IsGroupHas, ToggleGroupHas)
 	-- Hide groups that have anyone of a ticked class (Arc, 2026-09-21: "if I
 	-- don't want a group that has a hunter, a rogue or a warrior").
 	local groupMenu = root:CreateButton(AnyGroupExclusion()
@@ -2222,6 +2749,7 @@ local function BuildMenu(owner, root)
 	root:CreateDivider()
 	root:CreateTitle("Invites")
 	root:CreateCheckbox("Whisper when I invite", WhisperOn, ToggleWhisper)
+	root:CreateCheckbox("Whisper queue", WQ.On, WQ.Toggle)
 	root:CreateButton("Edit invite message", ShowSettings)
 	for _, extend in ipairs(NS.menuExtras) do extend(root) end
 	root:CreateDivider()
@@ -2255,6 +2783,8 @@ local function SummaryLines()
 	end
 	if showMode ~= "players" then
 		if openSpotOnly then lines[#lines + 1] = "Groups with a spot for: " .. MyRolesText() end
+		if AnyGroupNeeds() then lines[#lines + 1] = "Groups with an open spot for: " .. RoleNames(groupNeeds) end
+		if AnyGroupHas() then lines[#lines + 1] = "Groups that already have: " .. RoleNames(groupHas) end
 		if AnyGroupExclusion() then lines[#lines + 1] = "Hiding groups with: " .. ClassNames(groupExclude) end
 	end
 	return lines
@@ -2300,7 +2830,7 @@ local function OnBlizzardRedraw()
 	if results and not issecret(results) then
 		Log(string.format("blizzard: list rebuilt, %d listings (searching=%s)", #results, S(frame.searching)))
 	end
-	if FilterActive() then
+	if FilterActive() or (WQ.On() and #WQ.items > 0) then
 		RebuildView()
 	elseif view and view:IsShown() then
 		view:Hide()

@@ -1066,6 +1066,13 @@ function AT.LayoutPage(pg)
             local boxTop = topY - hdrH
             span(sec.box, boxTop)
 
+            -- SYNC BEFORE MEASURING. A row whose label text only arrives in
+            -- _sync (every dynamic list row) was otherwise measured while still
+            -- EMPTY, so the control column came out at ~26px and the label
+            -- rendered as ".." until some later layout re-measured it.
+            for _, r in ipairs(sec.rows) do
+                if r._sync then r._sync() end
+            end
             -- CONTROL COLUMN, measured. Use the UNBOUNDED width: GetStringWidth
             -- reports the already-truncated width, so a truncated label would feed
             -- a smaller column back in on the next pass and ratchet down.
@@ -1081,7 +1088,6 @@ function AT.LayoutPage(pg)
             end
             local by = -2
             for _, row in ipairs(sec.rows) do
-                if row._sync then row._sync() end
                 if (not row._visibleFn) or row._visibleFn() then
                     row:ClearAllPoints()
                     row:SetPoint("TOPLEFT", sec.box, "TOPLEFT", 6, by)

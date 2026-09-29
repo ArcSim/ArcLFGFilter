@@ -1,5 +1,19 @@
 # Arc LFG Filter changelog
 
+## 1.2.0
+
+### New Features
+- **Whisper queue** - While your group is listed, everyone who whispers you lands in a Whispers section at the top of the list, next to Players and Groups and collapsible the same way: their class, level, the roles they signed up as, where they are and what they wrote, with Invite and Reply on every line. Someone standing in your own zone is marked "here". Turn it on with Whisper queue in the filter menu.
+- **Quick messages** - The Send Message box has ready-made lines to click. The first one says "Level 20 Mage here, can I join?" with your own level and class filled in. Write your own under /arclfg.
+- **Find groups by the roles they still need** - Open spot for: pick Tank, Healer or DPS and only groups with a free slot for one of them are shown, whichever role you are queued as.
+- **Find groups by who they already have** - Already has: pick the roles a group must already include, for example only groups that have found a tank.
+
+### Improvements
+- **Role and class icons in the menu** - Tank, Healer and DPS entries now show the game's role icons, and every class in both class lists shows its class icon.
+
+### Bug Fixes
+- **Buttons behind the list** - Send Message and Group Invite could end up behind the filtered list at the bottom of the window.
+
 ## 1.1.0
 
 ### New Features
