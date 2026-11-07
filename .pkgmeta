@@ -20,3 +20,4 @@ ignore:
   - CLAUDE.md
   - Media/Store
   - "*.bak"
+  - design

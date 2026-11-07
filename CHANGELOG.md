@@ -1,5 +1,28 @@
 # Arc LFG Filter changelog
 
+## 1.3.0
+
+### New Features
+- **The filter is a panel now** - Every option sits in a panel attached to the side of the Looking For Group window, in the game's own panel art, instead of a menu you have to hold open, with a tab for player rules, a tab for group rules and a tab for invites. The count sits along the bottom. The funnel button opens and shuts it, a fourth tab on the window's own tab strip does too, and right-clicking the funnel still opens the old menu.
+- **Only ones near me** - One tick keeps the players standing in your zone, the groups whose leader is, and anyone already at the dungeon they listed for, so you stop inviting people who are a continent away.
+- **Roles per class** - Every class has its own line with its own Tank, Healer and DPS buttons: tank and damage warriors is two clicks on the warrior line. A class with nothing picked still means any role, and asking for a role ticks the class with it.
+- **Groups that must have a class** - The group class list answers three ways now. Click once and only groups holding that class are shown, which is how you find a group that already has a warlock to summon you; click again to hide every group with one; click again for any.
+- **Set what you are without leaving the window** - The Groups tab has your own Tank, Healer and DPS buttons. They are your real listing's roles, so "Has a spot for me" follows them straight away.
+- **Invite someone as a role** - The invite whisper says what you are inviting them for: "Inviting you to run Deadmines as Tank" is the line it ships with now. Someone who listed one role gets it by itself, and when they listed several the invite asks which one you want first, from the list and from the whisper queue alike. Write your own line on the Invites tab; an invite message you had already written is left exactly as it was.
+- **Quick messages, your way** - Mark which one fills the Send Message box, write {level}, {class} and {role} and they fill themselves in, and a line you tweak before sending is kept for next time. All three lines are editable in the Invites tab.
+- **Suggest invite** - In someone else's group, where the game will not let you invite, the invite button becomes Suggest and asks your group leader to invite the player, exactly like the game's own Suggest Invite. It greys out when the group is already full.
+
+### Improvements
+- **Where everyone is** - Each listing shows the zone the player is standing in, or the leader's zone for a group, next to the dungeon. Your own zone is green, so anyone nearby stands out.
+- **Your filter is remembered** - It comes back after a reload and after logging out, instead of starting empty every session.
+- **The list is ready when you open the window** - The addon's list is in place as soon as you start looking, filter or no filter.
+- **Every class, always** - The class list holds all nine with how many are in the results right now, so it never reflows while you are reading it.
+- **The menu stops jumping** - Ticking a filter in the old menu no longer resizes it under your cursor.
+
+### Bug Fixes
+- **Listings behind the buttons** - The last row of the list could sit behind Send Message and Group Invite.
+- **A class you unticked could still filter** - Roles picked from a class kept filtering after the class itself was off, with nothing on screen to say so. Clearing a class, or Any class, now clears its roles with it.
+
 ## 1.2.0
 
 ### New Features

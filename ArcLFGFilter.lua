@@ -65,15 +65,17 @@ local ADDON, NS = ...
 local issecret = issecretvalue or function() return false end
 
 local ROLES = {
-	{ key = "TANK",    solo = "tank",   label = "Tank" },
-	{ key = "HEALER",  solo = "healer", label = "Healer" },
-	{ key = "DAMAGER", solo = "dps",    label = "DPS" },
+	{ key = "TANK",    solo = "tank",   label = "Tank",   letter = "T" },
+	{ key = "HEALER",  solo = "healer", label = "Healer", letter = "H" },
+	{ key = "DAMAGER", solo = "dps",    label = "DPS",    letter = "D" },
 }
 
+-- short = the panel's button, which has room for one word; label is the
+-- wording the menu used and the button's tooltip still carries
 local SHOW_MODES = {
-	{ key = "both",    label = "Players and groups" },
-	{ key = "players", label = "Players only" },
-	{ key = "groups",  label = "Groups only" },
+	{ key = "both",    label = "Players and groups", short = "All" },
+	{ key = "players", label = "Players only",       short = "Players" },
+	{ key = "groups",  label = "Groups only",        short = "Groups" },
 }
 
 local FILTER_ATLAS   = "ui-questtrackerbutton-filter"
@@ -81,7 +83,7 @@ local FALLBACK_ATLAS = "groupfinder-icon-role-large-tank"
 local STATUS_WIDEST  = "Paused: roles hidden" -- sizes the menu's status line
 local MAX_LOG_LINES  = 800
 
-local DEFAULT_MESSAGE  = "Inviting you to run {dungeon}"
+local DEFAULT_MESSAGE  = "Inviting you to run {dungeon} as {role}"
 local FALLBACK_DUNGEON = "a dungeon" -- {dungeon} when the listing names none
 local SAMPLE_DUNGEON   = "Deadmines" -- settings preview when nothing is picked
 local SAMPLE_NAME      = "Rowan"     -- settings preview for {name}
@@ -102,6 +104,9 @@ local classActive = {}              -- [classFile] = true while that class is ti
 local groupExclude = {}             -- [classFile] = true: hide groups with that class in them
 local groupNeeds = {}               -- [role key] = true: group must have an open spot for it
 local groupHas = {}                 -- [role key] = true: group must already have that role
+-- Per-class roles, saving the filter and suggesting an invite live on one
+-- table: the file is at Lua's 200-local ceiling.
+local F = { classRoles = {} }       -- classRoles[classFile] = { [role key] = true }
 local minLevel                      -- nil, or the lowest level a solo player may be
 local showMode = "both"             -- "both", "players" or "groups"
 local openSpotOnly = false          -- groups: only those with a slot for my role
@@ -110,7 +115,8 @@ local pausedReason                  -- nil, "lockdown" or "hidden"
 local lockSeen = "no"               -- last lockdown reading: "no", "yes" or "secret"
 local db                            -- ArcLFGFilterDB once this addon has loaded
 local lastWhisper = {}              -- [name] = GetTime() of the last invite whisper
-local filterButton, panel, settingsWindow, settingsPage, whisperBox
+local panel            -- the debug log window
+local frames = {}      -- button, settings, page, whisper: one table, the file is at Lua's 200-local cap
 local view                          -- the addon's own list over Blizzard's
 local viewRows, viewHeaders = {}, {} -- pooled row and header buttons
 local selectedID                    -- the listing selected in our list
@@ -172,6 +178,48 @@ local function AnyGroupExclusion()
 	return next(groupExclude) ~= nil
 end
 
+-- Roles picked for one class ("for Paladin I only want healers and tanks").
+-- A class with none set takes the roles ticked at the top of the menu.
+function F.ClassRoles(classFile)
+	local set = F.classRoles[classFile]
+	return (set and next(set)) and set or nil
+end
+
+function F.IsClassRole(data)
+	local classFile, key = data:match("^(%u+):(%u+)$")
+	local set = classFile and F.classRoles[classFile]
+	return (set and set[key]) == true
+end
+
+function F.ToggleClassRole(data)
+	local classFile, key = data:match("^(%u+):(%u+)$")
+	if not classFile then return end
+	local set = F.classRoles[classFile] or {}
+	set[key] = not set[key] or nil
+	F.classRoles[classFile] = next(set) and set or nil
+	-- picking a role for a class is also picking the class
+	if F.classRoles[classFile] then classActive[classFile] = true end
+	Log("menu: " .. classFile .. " roles -> " .. (F.RoleList(classFile) or "any"))
+	if F.Changed then F.Changed() end
+end
+
+function F.ClearClassRoles(classFile)
+	F.classRoles[classFile] = nil
+	Log("menu: " .. classFile .. " roles -> any")
+	if F.Changed then F.Changed() end
+end
+
+-- "Tank, Healer" for a class, or nil when it takes any role.
+function F.RoleList(classFile)
+	local set = F.ClassRoles(classFile)
+	if not set then return nil end
+	local names = {}
+	for _, role in ipairs(ROLES) do
+		if set[role.key] then names[#names + 1] = role.label end
+	end
+	return table.concat(names, ", ")
+end
+
 local function AnyGroupNeeds()
 	return next(groupNeeds) ~= nil
 end
@@ -182,7 +230,41 @@ end
 
 local function FilterActive()
 	return showMode ~= "both" or openSpotOnly or AnyRoleTicked() or AnyClassTicked() or AnyGroupExclusion()
-		or minLevel ~= nil or AnyGroupNeeds() or AnyGroupHas()
+		or minLevel ~= nil or AnyGroupNeeds() or AnyGroupHas() or F.nearby
+		or next(F.mustClass) ~= nil
+end
+
+function F.IsNearbyOn()
+	return F.nearby and true or false
+end
+
+-- A class in a group answers three ways, on one row: any, the group must
+-- hold one, or hide every group that does.
+F.mustClass = {}
+
+function F.ClassState(classFile)
+	if F.mustClass[classFile] then return "must" end
+	if groupExclude[classFile] then return "hide" end
+	return "any"
+end
+
+function F.CycleClass(classFile)
+	local state = F.ClassState(classFile)
+	F.mustClass[classFile] = (state == "any") and true or nil
+	groupExclude[classFile] = (state == "must") and true or nil
+	Log("menu: groups " .. classFile .. " -> " .. F.ClassState(classFile))
+	if F.Changed then F.Changed() end
+end
+
+function F.AnyClassState()
+	return (next(F.mustClass) ~= nil or AnyGroupExclusion()) and true or false
+end
+
+function F.ClearClassStates()
+	wipe(F.mustClass)
+	wipe(groupExclude)
+	Log("menu: groups any class")
+	if F.Changed then F.Changed() end
 end
 
 -- A rule about which PLAYERS match (role, class or level), as opposed to the
@@ -224,11 +306,16 @@ local function ClassLabel(classFile)
 end
 
 -- The classes in a set (classActive or groupExclude), in class order, joined.
-local function ClassNames(set)
+-- withRoles names the roles a class is limited to: "Warlock (Healer, DPS)".
+local function ClassNames(set, withRoles)
 	local list = {}
 	for classFile in pairs(set) do list[#list + 1] = classFile end
 	SortClasses(list)
-	for i, classFile in ipairs(list) do list[i] = ClassLabel(classFile) end
+	for i, classFile in ipairs(list) do
+		local name = ClassLabel(classFile)
+		local roles = withRoles and F.RoleList(classFile)
+		list[i] = roles and (name .. " (" .. roles .. ")") or name
+	end
 	return table.concat(list, ", ")
 end
 
@@ -252,6 +339,34 @@ local function MyRolesText()
 	return table.concat(names, "/")
 end
 
+-- The roles you are signed up as are the game's own, not ours: the same call
+-- the window's Listing tab makes, so your listing follows what you tick here.
+function F.IsMine(key)
+	local roles = MyRoles()
+	if not roles then return false end
+	for _, role in ipairs(ROLES) do
+		if role.key == key then
+			local on = roles[role.solo]
+			return (not issecret(on)) and on == true
+		end
+	end
+	return false
+end
+
+function F.ToggleMine(key)
+	local roles = MyRoles()
+	if not roles or not (C_LFGListRoles and C_LFGListRoles.SetRoles) then return end
+	local wanted = {}
+	for _, role in ipairs(ROLES) do
+		local on = roles[role.solo]
+		wanted[role.solo] = (not issecret(on)) and on == true or false
+		if role.key == key then wanted[role.solo] = not wanted[role.solo] end
+	end
+	local ok = C_LFGListRoles.SetRoles(wanted, false)
+	Log("menu: my roles -> " .. (MyRolesText() or "?") .. " (" .. S(ok) .. ")")
+	if F.Changed then F.Changed() end
+end
+
 local function FilterSummary()
 	local parts = {}
 	if showMode == "players" then
@@ -261,14 +376,16 @@ local function FilterSummary()
 	end
 	if showMode ~= "groups" then
 		if AnyRoleTicked() then parts[#parts + 1] = "players: " .. ActiveNames() end
-		if AnyClassTicked() then parts[#parts + 1] = "class: " .. ClassNames(classActive) end
+		if AnyClassTicked() then parts[#parts + 1] = "class: " .. ClassNames(classActive, true) end
 		if minLevel then parts[#parts + 1] = "level " .. minLevel .. "+" end
 	end
+	if F.nearby then parts[#parts + 1] = "near me (" .. (F.MyZone() or "?") .. ")" end
 	if showMode ~= "players" then
 		if openSpotOnly then parts[#parts + 1] = "groups: spot for " .. MyRolesText() end
 		if AnyGroupNeeds() then parts[#parts + 1] = "groups needing: " .. RoleNames(groupNeeds) end
 		if AnyGroupHas() then parts[#parts + 1] = "groups with: " .. RoleNames(groupHas) end
 		if AnyGroupExclusion() then parts[#parts + 1] = "groups without: " .. ClassNames(groupExclude) end
+		if next(F.mustClass) then parts[#parts + 1] = "groups with: " .. ClassNames(F.mustClass) end
 	end
 	if #parts == 0 then return "none" end
 	return table.concat(parts, "; ")
@@ -294,26 +411,31 @@ local function Verdict(resultID)
 	if numMembers == 1 then
 		if showMode == "groups" then return false end
 		local wantRoles, wantClasses = AnyRoleTicked(), AnyClassTicked()
-		if not (wantRoles or wantClasses or minLevel) then return true end
+		if not (wantRoles or wantClasses or minLevel or F.nearby) then return true end
 		local member = C_LFGList.GetSearchResultPlayerInfo(resultID, 1)
 		if not member then return false end
 		if issecret(member) then return nil end
+		if F.nearby and not F.IsNear(Plain(member.areaName), info.activityIDs) then return false end
 		if minLevel then
 			local level = member.level
 			if issecret(level) then return nil end
 			if not level or level < minLevel then return false end
 		end
+		local classFile
 		if wantClasses then
-			local classFile = member.classFilename
+			classFile = member.classFilename
 			if issecret(classFile) then return nil end
 			if not (classFile and classActive[classFile]) then return false end
 		end
-		if not wantRoles then return true end
+		-- the roles this player must have: the ones picked for their class
+		-- when it has its own list, else the roles ticked at the top
+		local roleSet = (classFile and F.ClassRoles(classFile)) or (wantRoles and active or nil)
+		if not roleSet then return true end
 		local roles = member.lfgRoles
 		if not roles then return false end
 		if issecret(roles) then return nil end
 		for _, role in ipairs(ROLES) do
-			if active[role.key] then
+			if roleSet[role.key] then
 				local can = roles[role.solo]
 				if issecret(can) then return nil end
 				if can then return true end
@@ -323,18 +445,32 @@ local function Verdict(resultID)
 	end
 
 	if showMode == "players" then return false end
-	-- "Hide groups with": any member of a ticked class drops the group; a
-	-- member the game gives no info for simply cannot count against it
-	if AnyGroupExclusion() then
+	-- The classes rule: a hidden class drops the group, a must-have class the
+	-- group does not hold drops it too. A member the game gives no info for
+	-- simply cannot count against it.
+	if AnyGroupExclusion() or next(F.mustClass) then
+		local present = {}
 		for m = 1, numMembers do
 			local member = C_LFGList.GetSearchResultPlayerInfo(resultID, m)
 			if member then
 				if issecret(member) then return nil end
 				local classFile = member.classFilename
 				if issecret(classFile) then return nil end
-				if classFile and groupExclude[classFile] then return false end
+				if classFile then
+					if groupExclude[classFile] then return false end
+					present[classFile] = true
+				end
 			end
 		end
+		for classFile in pairs(F.mustClass) do
+			if not present[classFile] then return false end
+		end
+	end
+	-- a group is where its leader is
+	if F.nearby then
+		local leader = C_LFGList.GetSearchResultLeaderInfo(resultID)
+		local area = (leader and not issecret(leader)) and Plain(leader.areaName) or nil
+		if not F.IsNear(area, info.activityIDs) then return false end
 	end
 	if not (openSpotOnly or AnyGroupNeeds() or AnyGroupHas()) then return true end
 	-- The role counts Blizzard ranks groups with: TANK/HEALER/DAMAGER = who is
@@ -412,6 +548,7 @@ end
 local function SetTypedMessage(text)
 	if not db then return end
 	text = (text or ""):match("^%s*(.-)%s*$")
+	if text == DEFAULT_MESSAGE then text = "" end
 	db.inviteMessage = (text ~= "") and text or nil
 end
 
@@ -430,24 +567,104 @@ local QM = {
 	SLOTS = 3,
 	DEFAULT = "Level {level} {class} here, can I join?",
 }
+QM.DEFAULTS = {
+	QM.DEFAULT,
+	"Level {level} {class} {role} here, can I join?",
+	"Invite me when you have room",
+}
 
 function QM.Text(i)
 	local saved = db and db.quickMessages and db.quickMessages[i]
 	if type(saved) == "string" and saved ~= "" then return saved end
-	if i == 1 then return QM.DEFAULT end
-	return nil
+	return QM.DEFAULTS[i]
+end
+
+-- Which one fills the Send Message box when it opens.
+function QM.First()
+	local i = db and db.quickFirst
+	if type(i) == "number" and i >= 1 and i <= QM.SLOTS then return i end
+	return 1
+end
+
+function QM.SetFirst(i)
+	if not db then return end
+	db.quickFirst = (i ~= 1) and i or nil
+	Log("settings: quick message " .. i .. " goes in the box")
+end
+
+-- Your own roles, for {role} in a quick message.
+function QM.MyRoles()
+	return MyRolesText()
 end
 
 function QM.Set(i, text)
 	if not db then return end
 	text = (text or ""):match("^%s*(.-)%s*$")
-	if i == 1 and text == QM.DEFAULT then text = "" end
+	if text == QM.DEFAULTS[i] then text = "" end
 	db.quickMessages = db.quickMessages or {}
 	db.quickMessages[i] = (text ~= "") and text or nil
 	if not next(db.quickMessages) then db.quickMessages = nil end
 end
 
 -- Runs once this addon's saved file has had its chance to load.
+-- The filter is remembered across reloads and logins (Arc, 2026-10-11: "I
+-- want the filter to remember what filter I had before"). Saved account-wide
+-- beside the invite settings; anything unreadable in the file is ignored.
+local function CopySet(from, into)
+	wipe(into)
+	if type(from) ~= "table" then return into end
+	for key, value in pairs(from) do
+		if type(key) == "string" and value == true then into[key] = true end
+	end
+	return into
+end
+
+function F.Save()
+	if not db then return end
+	local roles = {}
+	for classFile, set in pairs(F.classRoles) do
+		if next(set) then roles[classFile] = CopySet(set, {}) end
+	end
+	db.filter = {
+		roles = CopySet(active, {}),
+		classes = CopySet(classActive, {}),
+		hide = CopySet(groupExclude, {}),
+		must = CopySet(F.mustClass, {}),
+		needs = CopySet(groupNeeds, {}),
+		has = CopySet(groupHas, {}),
+		classRoles = next(roles) and roles or nil,
+		level = minLevel,
+		show = (showMode ~= "both") and showMode or nil,
+		spot = openSpotOnly or nil,
+		near = F.nearby or nil,
+	}
+end
+
+function F.Restore()
+	local saved = db and db.filter
+	if type(saved) ~= "table" then return end
+	CopySet(saved.roles, active)
+	CopySet(saved.classes, classActive)
+	CopySet(saved.hide, groupExclude)
+	CopySet(saved.must, F.mustClass)
+	CopySet(saved.needs, groupNeeds)
+	CopySet(saved.has, groupHas)
+	wipe(F.classRoles)
+	if type(saved.classRoles) == "table" then
+		for classFile, set in pairs(saved.classRoles) do
+			if type(classFile) == "string" then
+				local copy = CopySet(set, {})
+				if next(copy) then F.classRoles[classFile] = copy end
+			end
+		end
+	end
+	local level = tonumber(saved.level)
+	minLevel = (level and level > 1) and math.floor(level) or nil
+	showMode = (saved.show == "players" or saved.show == "groups") and saved.show or "both"
+	openSpotOnly = saved.spot == true
+	F.nearby = saved.near == true
+end
+
 local function LoadSettings()
 	local found = type(ArcLFGFilterDB) == "table"
 	if not found then ArcLFGFilterDB = {} end
@@ -455,6 +672,7 @@ local function LoadSettings()
 	Log(string.format("settings: %s - invite whisper %s, message %s",
 		found and "loaded from the saved file" or "nothing saved yet, defaults",
 		WhisperOn() and "ON" or "off", (TypedMessage() ~= "") and "custom" or "default"))
+	F.Restore()
 end
 
 -- On Forever other players' names come in two parts ("First Last"); {name}
@@ -494,14 +712,25 @@ function QM.MyClass()
 	return name
 end
 
-local function BuildMessage(template, dungeon, name)
+-- {role} is the role in hand: yours in a quick message, the one you are
+-- inviting someone AS in an invite whisper. Unknown, it drops out quietly.
+local function BuildMessage(template, dungeon, name, role)
+	if not role or role == "" then
+		local head, tail = template:match("^(.-)%s*{[rR][oO][lL][eE]}(.*)$")
+		if head then
+			head = head:gsub("%s+%a%a?%a?$", ""):gsub("%s+%a%a?%a?$", "")
+			template = head .. tail
+		end
+	end
 	local text = template:gsub("{(%a+)}", function(key)
 		key = key:lower()
 		if key == "dungeon" then return dungeon end
 		if key == "name" then return name end
 		if key == "level" then local l = QM.MyLevel() return l and tostring(l) or nil end
 		if key == "class" then return QM.MyClass() end
+		if key == "role" then return role or "" end
 	end)
+	text = text:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+([,.!?])", "%1")
 	return ChatSafe(text)
 end
 
@@ -576,6 +805,93 @@ local function DungeonFor(activityIDs)
 		or FirstActivityName(activityIDs)
 end
 
+-------------------------------------------------------------------------------
+-- Near me: who can actually be there soon. Their zone rides along with the
+-- listing; the zone a dungeon sits in comes from the client's OWN map tree,
+-- so there is no table of ours to keep up to date and it reads in whatever
+-- language the player runs.
+-------------------------------------------------------------------------------
+
+function F.MyZone()
+	local zone = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText())
+	if issecret(zone) or type(zone) ~= "string" or zone == "" then return nil end
+	return zone
+end
+
+-- Every dungeon map under the world, with the zone it hangs off. Built once.
+function F.ZoneIndex()
+	if F.zoneIndex then return F.zoneIndex end
+	local index = {}
+	F.zoneIndex = index
+	if not (C_Map and C_Map.GetMapChildrenInfo and C_Map.GetMapInfo and C_Map.GetBestMapForUnit) then
+		return index
+	end
+	local map = Plain(C_Map.GetBestMapForUnit("player"))
+	for _ = 1, 12 do -- climb to the top of the tree
+		local info = map and Plain(C_Map.GetMapInfo(map))
+		local parent = info and Plain(info.parentMapID)
+		if not parent or parent == 0 then break end
+		map = parent
+	end
+	if not map then return index end
+	local kind = (Enum and Enum.UIMapType and Enum.UIMapType.Dungeon) or 4
+	local dungeons = Plain(C_Map.GetMapChildrenInfo(map, kind, true))
+	if type(dungeons) ~= "table" then return index end
+	local placed = 0
+	for _, entry in ipairs(dungeons) do
+		local name = Plain(entry.name)
+		local above = Plain(entry.parentMapID)
+		local zone = above and Plain(C_Map.GetMapInfo(above))
+		zone = zone and Plain(zone.name)
+		if type(name) == "string" and name ~= "" and type(zone) == "string" and zone ~= "" then
+			index[name:lower()] = zone
+			placed = placed + 1
+		end
+	end
+	-- an empty answer is not an answer: let the next call try again, in case
+	-- the map was not ready yet
+	if placed == 0 then F.zoneIndex = nil end
+	Log("near me: " .. placed .. " dungeons placed from the map tree")
+	return index
+end
+
+-- The zone a dungeon sits in, plus the dungeon's own map name.
+function F.DungeonZone(dungeon)
+	if type(dungeon) ~= "string" or dungeon == "" then return nil end
+	local index = F.ZoneIndex()
+	local key = dungeon:lower()
+	if index[key] then return index[key], key end
+	for name, zone in pairs(index) do
+		if name:find(key, 1, true) or key:find(name, 1, true) then return zone, name end
+	end
+	-- a wing carries only part of its dungeon's name ("Scarlet Graveyard"):
+	-- one long word in common places it
+	for word in key:gmatch("[^%s%-]+") do
+		if #word >= 5 then
+			for name, zone in pairs(index) do
+				if name:find(word, 1, true) then return zone, name end
+			end
+		end
+	end
+	return nil
+end
+
+-- Their zone is yours, the dungeon's, or the dungeon itself. A zone the game
+-- will not read out keeps the listing: there is nothing to judge it on.
+function F.IsNear(area, activityIDs)
+	if type(area) ~= "string" or area == "" then return true end
+	local mine = F.MyZone()
+	if mine and area == mine then return true end
+	local dungeon = DungeonFor(activityIDs)
+	if not dungeon then return false end
+	local key = area:lower()
+	if key == dungeon:lower() then return true end
+	local zone, mapName = F.DungeonZone(dungeon)
+	if zone and area == zone then return true end
+	if mapName and key == mapName then return true end
+	return false
+end
+
 -- The settings preview names what you are set up for right now.
 local function PreviewDungeon()
 	return FirstActivityName(MyActivityIDs()) or FirstActivityName(PickedActivityIDs()) or SAMPLE_DUNGEON
@@ -601,11 +917,13 @@ local function SoloListingOf(name)
 	return nil
 end
 
-local function SendWhisper(text, target)
+-- A whisper by default; the suggest button passes PARTY or RAID instead.
+local function SendWhisper(text, target, channel)
+	channel = channel or "WHISPER"
 	if C_ChatInfo and C_ChatInfo.SendChatMessage then
-		C_ChatInfo.SendChatMessage(text, "WHISPER", nil, target)
+		C_ChatInfo.SendChatMessage(text, channel, nil, target)
 	else
-		SendChatMessage(text, "WHISPER", nil, target)
+		SendChatMessage(text, channel, nil, target)
 	end
 end
 
@@ -641,7 +959,12 @@ local function WhisperInvitee(name, auto)
 		Log(string.format("invite: %s - whispered %ds ago, not again", name, math.floor(now - last)))
 		return
 	end
-	local text = BuildMessage(MessageTemplate(), DungeonFor(listing.activityIDs) or FALLBACK_DUNGEON, FirstName(name))
+	-- the role you picked on the way in, else the only one they signed up as
+	local role = F.pendingRole and F.pendingRole[name]
+	if F.pendingRole then F.pendingRole[name] = nil end
+	if not role then role = F.OnlyRole(listing) end
+	local text = BuildMessage(MessageTemplate(), DungeonFor(listing.activityIDs) or FALLBACK_DUNGEON,
+		FirstName(name), role)
 	if not text:match("%S") then
 		Log("invite: " .. name .. " - message is empty, no whisper")
 		return
@@ -649,6 +972,40 @@ local function WhisperInvitee(name, auto)
 	lastWhisper[name] = now
 	SendWhisper(text, name)
 	Log("invite: whispered " .. name .. ": " .. text)
+end
+
+-- Which roles a listing signed up as, and the one role when there is only
+-- one: that needs no asking.
+F.pendingRole = {}
+
+function F.ListingRoles(listing)
+	local id = listing and Plain(listing.searchResultID)
+	local member = id and C_LFGList.GetSearchResultPlayerInfo(id, 1)
+	if not member or issecret(member) then return nil end
+	local roles = member.lfgRoles
+	if not roles or issecret(roles) then return nil end
+	local out = {}
+	for _, role in ipairs(ROLES) do
+		local on = roles[role.solo]
+		if not issecret(on) and on then out[#out + 1] = role end
+	end
+	return out
+end
+
+function F.OnlyRole(listing)
+	local roles = F.ListingRoles(listing)
+	return (roles and #roles == 1) and roles[1].label or nil
+end
+
+-- True when the invite whisper would say a role but the listing offers more
+-- than one, so the player has to say which.
+function F.NeedsRolePick(listing)
+	if not WhisperOn() then return nil end
+	local template = MessageTemplate()
+	if not (template and template:lower():find("{role}", 1, true)) then return nil end
+	local roles = F.ListingRoles(listing)
+	if not roles or #roles < 2 then return nil end
+	return roles
 end
 
 -- Post-hook on C_PartyInfo.InviteUnit: the invite has already run (and
@@ -735,7 +1092,7 @@ local function Snapshot(label)
 	local frame = LFGBrowseFrame
 	Log("---- SNAPSHOT (" .. label .. ") ----")
 	Log(string.format("LFG window: loaded=%s shown=%s searching=%s  filter button=%s",
-		S(frame ~= nil), S(frame and frame:IsShown()), S(frame and frame.searching), S(filterButton ~= nil)))
+		S(frame ~= nil), S(frame and frame:IsShown()), S(frame and frame.searching), S(frames.button ~= nil)))
 	local lockRaw = C_ChatInfo and C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown()
 	local inInstance, instanceType = IsInInstance()
 	Log(string.format("InChatMessagingLockdown=%s  issecretvalue exists=%s  inInstance=%s (%s)  inCombat=%s",
@@ -849,7 +1206,7 @@ local WQ = {
 -------------------------------------------------------------------------------
 
 local function RefreshSettings()
-	if settingsWindow and settingsWindow:IsShown() then NS.AT.LayoutPage(settingsPage) end
+	if frames.settings and frames.settings:IsShown() then NS.AT.LayoutPage(frames.page) end
 end
 
 local function ToggleWhisper()
@@ -927,13 +1284,13 @@ local function BuildSettings()
 	AT.AddDiscordFooter(win, "ArcLFGFilterDiscordCopy")
 	-- CreateWindow owns OnShow via SetScript: hook it, never replace it
 	win:HookScript("OnShow", function() AT.LayoutPage(pg) end)
-	settingsWindow, settingsPage = win, pg
+	frames.settings, frames.page = win, pg
 end
 
 local function ShowSettings()
-	if not settingsWindow then BuildSettings() end
-	settingsWindow:Show()
-	NS.AT.LayoutPage(settingsPage)
+	if not frames.settings then BuildSettings() end
+	frames.settings:Show()
+	NS.AT.LayoutPage(frames.page)
 	-- the first pass runs before the anchors resolve; measure again next frame
 	C_Timer.After(0, RefreshSettings)
 end
@@ -964,7 +1321,7 @@ local function OpenWhisperBox(name)
 	if not name then return end
 	local AT = NS.AT
 	local COL = AT.COL
-	if not whisperBox then
+	if not frames.whisper then
 		local win = AT.CreateWindow("ArcLFGFilterWhisper", {
 			title = "|cff3fc9f2Arc|r|cffd5e2f2 Send Message|r",
 			w = 380, h = 152, minW = 380, minH = 152, resizable = false,
@@ -1005,9 +1362,19 @@ local function OpenWhisperBox(name)
 			end
 			SendWhisper(text, win.target)
 			Log("whisper box: sent to " .. win.target)
+			-- a message you tweaked before sending is kept for next time
+			if win.slot and win.filled and text ~= win.filled then
+				QM.Set(win.slot, box:GetText())
+				Log("whisper box: quick message " .. win.slot .. " kept as sent")
+			end
 			box:SetText("")
 			win:Hide()
 		end
+		-- clear the box and your quick message is safe: only an edit OF the
+		-- message that is in there is kept when you send it
+		box:SetScript("OnTextChanged", function(self, byUser)
+			if byUser and (self:GetText() or "") == "" then win.slot = nil end
+		end)
 		box:SetScript("OnEnterPressed", Send)
 		box:SetScript("OnEscapePressed", function() win:Hide() end)
 		send:SetScript("OnClick", Send)
@@ -1025,27 +1392,40 @@ local function OpenWhisperBox(name)
 			b:SetScript("OnClick", function()
 				local template = QM.Text(i)
 				if not template then return end
-				box:SetText(BuildMessage(template, QuickDungeon(win.target), FirstName(win.target)))
+				win.slot = i
+				win.filled = BuildMessage(template, QuickDungeon(win.target), FirstName(win.target), QM.MyRoles())
+				box:SetText(win.filled)
 				box:SetFocus()
 				box:SetCursorPosition(#(box:GetText() or ""))
 			end)
 			quick[i] = b
 		end
 		win.Label, win.Box, win.Hint, win.Quick = label, box, hint, quick
-		whisperBox = win
+		frames.whisper = win
 	end
-	whisperBox.target = name
-	whisperBox.Label:SetText("To " .. name)
-	whisperBox.Hint:SetText("Enter sends, Esc closes.")
-	for i, button in ipairs(whisperBox.Quick) do
+	frames.whisper.target = name
+	frames.whisper.Label:SetText("To " .. name)
+	frames.whisper.Hint:SetText("Enter sends, Esc closes.")
+	for i, button in ipairs(frames.whisper.Quick) do
 		local template = QM.Text(i)
 		button:SetShown(template ~= nil)
 		if template then
-			button.fs:SetText(Shorten(BuildMessage(template, QuickDungeon(name), FirstName(name)), 15))
+			button.fs:SetText(Shorten(BuildMessage(template, QuickDungeon(name), FirstName(name), QM.MyRoles()), 15))
 		end
 	end
-	whisperBox:Show()
-	whisperBox.Box:SetFocus()
+	-- the one you marked fills the box, ready to send or to tweak
+	local first = QM.First()
+	local opener = QM.Text(first)
+	if opener then
+		frames.whisper.slot = first
+		frames.whisper.filled = BuildMessage(opener, QuickDungeon(name), FirstName(name), QM.MyRoles())
+		frames.whisper.Box:SetText(frames.whisper.filled)
+	else
+		frames.whisper.slot = nil
+		frames.whisper.Box:SetText("")
+	end
+	frames.whisper:Show()
+	frames.whisper.Box:SetFocus()
 end
 
 -------------------------------------------------------------------------------
@@ -1517,7 +1897,18 @@ local function RenderPopupPanel(level, node, anchorRow)
 		panel.rows[i]:Hide()
 		panel.rows[i].node = nil
 	end
-	panel:SetSize(widest + POPUP_PAD_W + POPUP_INSET_L + POPUP_INSET_R, -y + POPUP_INSET_B)
+	-- A MENU NEVER SHRINKS WHILE IT IS OPEN. Ticking a filter rewrites the
+	-- labels ("Class: any" becomes "Class: Paladin"), and a panel that
+	-- resizes under the cursor reads as the menu jumping about.
+	local key = (level == 1) and "root" or table.concat(popup.openPath, ".", 1, level - 1)
+	if panel.widthKey ~= key then panel.widthKey, panel.minWidth = key, 0 end
+	local width = widest + POPUP_PAD_W + POPUP_INSET_L + POPUP_INSET_R
+	if width < (panel.minWidth or 0) then
+		width = panel.minWidth
+	else
+		panel.minWidth = width
+	end
+	panel:SetSize(width, -y + POPUP_INSET_B)
 	panel:ClearAllPoints()
 	if anchorRow then
 		panel:SetPoint("TOPLEFT", anchorRow, "TOPRIGHT", POPUP_INSET_R + 10, POPUP_INSET_T)
@@ -1559,7 +1950,9 @@ end
 function PopupRowClick(row)
 	local node = row.node
 	if not node or not node.enabled or node.kind == "title" or node.kind == "divider" then return end
-	if #node.children > 0 then
+	-- a checkbox that carries a submenu still TICKS on click; its submenu is
+	-- on hover (the class rows, which hold their own role list)
+	if #node.children > 0 and node.kind ~= "checkbox" then
 		OpenPopupSubmenu(row)
 		return
 	end
@@ -1601,6 +1994,7 @@ function RefreshPopup()
 end
 
 function ClosePopup()
+	for _, panel in pairs(popup.panels) do panel.widthKey, panel.minWidth = nil, 0 end
 	ClosePopupFrom(1)
 	popup.generator, popup.owner = nil, nil
 	wipe(popup.openPath)
@@ -1641,10 +2035,10 @@ local function StatusText()
 end
 
 local function UpdateButton()
-	if not filterButton then return end
-	local badge = filterButton.Badge
+	if not frames.button then return end
+	local badge = frames.button.Badge
 	if FilterActive() then
-		filterButton:LockHighlight()
+		frames.button:LockHighlight()
 		if pausedReason then
 			badge:SetText("!")
 			badge:SetTextColor(1, 0.3, 0.3)
@@ -1654,9 +2048,11 @@ local function UpdateButton()
 		end
 		badge:Show()
 	else
-		filterButton:UnlockHighlight()
+		frames.button:UnlockHighlight()
 		badge:Hide()
 	end
+	-- the panel carries the same count and status line
+	if NS.Panel and NS.Panel.Refresh then NS.Panel.Refresh() end
 end
 
 -------------------------------------------------------------------------------
@@ -1665,14 +2061,48 @@ end
 
 local RebuildView -- defined below; the category headers call it
 
-local function CanInvite(entry)
-	if not (entry and entry.name and entry.solo) or entry.delisted or entry.self then return false end
-	return (not IsInGroup() or UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")) and true or false
+-- Suggest Invite is the SAME call as an invite: in someone else's group
+-- C_PartyInfo.InviteUnit asks the leader on your behalf and the game only
+-- changes the label (GetDisplayedInviteType -> SUGGEST_INVITE). It is refused
+-- only when the group is already full and you do not lead it.
+function F.MustSuggest()
+	return (IsInGroup() and not (UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")))
+		and true or false
 end
 
-local function InviteEntry(entry)
+function F.Blocked()
+	return F.MustSuggest() and C_PartyInfo.IsPartyFull and C_PartyInfo.IsPartyFull() and true or false
+end
+
+function F.InviteLabel(short)
+	if F.MustSuggest() then return "Suggest" end
+	return short and (INVITE or "Invite") or (GROUP_INVITE or "Group Invite")
+end
+
+local function CanInvite(entry)
+	if not (entry and entry.name and entry.solo) or entry.delisted or entry.self then return false end
+	return not F.Blocked()
+end
+
+local function InviteEntry(entry, owner)
 	if not CanInvite(entry) then return end
-	Log("our list: invite " .. entry.name)
+	-- when the whisper names a role and they signed up as several, ask which
+	-- before the invite goes out; the answer rides along to the whisper
+	local choices = entry.solo and F.NeedsRolePick(SoloListingOf(entry.name))
+	if choices and owner then
+		NS.OpenPopup(owner, function(_, root)
+			root:CreateTitle("Inviting " .. FirstName(entry.name) .. " as")
+			for _, role in ipairs(choices) do
+				root:CreateButton(role.label, function()
+					F.pendingRole[entry.name] = role.label
+					Log("our list: invite " .. entry.name .. " as " .. role.label)
+					C_PartyInfo.InviteUnit(entry.name)
+				end)
+			end
+		end)
+		return
+	end
+	Log("our list: " .. (F.MustSuggest() and "suggest " or "invite ") .. entry.name)
 	C_PartyInfo.InviteUnit(entry.name)
 end
 
@@ -1694,6 +2124,7 @@ local function UpdateViewButtons()
 	if not view then return end
 	local entry = SelectedEntry()
 	view.SendButton:SetEnabled(entry ~= nil and entry.name ~= nil)
+	view.InviteButton:SetText(F.InviteLabel())
 	view.InviteButton:SetEnabled(CanInvite(entry))
 end
 
@@ -1702,7 +2133,7 @@ local function ShowRowMenu(row)
 	NS.OpenPopup(row, function(owner, root)
 		root:CreateTitle(entry.name)
 		root:CreateButton(SEND_MESSAGE or "Send Message", function() OpenWhisperBox(entry.name) end)
-		local invite = root:CreateButton(GROUP_INVITE or "Group Invite", function() InviteEntry(entry) end)
+		local invite = root:CreateButton(F.InviteLabel(), function() InviteEntry(entry, owner) end)
 		invite:SetEnabled(CanInvite(entry))
 	end)
 end
@@ -1990,13 +2421,14 @@ local function FillRow(row, id, info)
 	local name = Plain(info.leaderName)
 	row.entry = { id = id, name = name, solo = isSolo, self = hasSelf, delisted = delisted }
 
-	local soloRoles
+	local soloRoles, area
 	if isSolo then
 		row.PartyIcon:Hide()
 		local member = C_LFGList.GetSearchResultPlayerInfo(id, 1)
 		local readable = member and not issecret(member)
 		local classFile = readable and Plain(member.classFilename)
 		local level = readable and Plain(member.level)
+		area = readable and Plain(member.areaName)
 		local atlas = classFile and ("groupfinder-icon-class-" .. classFile:lower())
 		if classFile and level and C_Texture.GetAtlasInfo(atlas) then
 			row.Level:SetText((LEVEL_ABBR or "Lvl") .. " " .. level)
@@ -2053,6 +2485,8 @@ local function FillRow(row, id, info)
 
 	local nameColor = NORMAL_FONT_COLOR
 	local leader = C_LFGList.GetSearchResultLeaderInfo(id)
+	-- a group shows where its leader is standing
+	if not area and leader and not issecret(leader) then area = Plain(leader.areaName) end
 	local leaderClass = leader and not issecret(leader) and Plain(leader.classFilename)
 	if leaderClass and RAID_CLASS_COLORS and RAID_CLASS_COLORS[leaderClass] then nameColor = RAID_CLASS_COLORS[leaderClass] end
 	local levelColor, activityColor = GRAY_FONT_COLOR, GRAY_FONT_COLOR
@@ -2070,6 +2504,17 @@ local function FillRow(row, id, info)
 	if row.Name:GetWidth() > NAME_MAX then row.Name:SetWidth(NAME_MAX) end
 	row.Level:SetTextColor(levelColor.r, levelColor.g, levelColor.b)
 	row.ClassIcon:SetDesaturated(delisted)
+	-- where they are, after the activity (Arc, 2026-10-11: "the current
+	-- location of the person in here"); green when it is your own zone
+	if type(area) == "string" and area ~= "" then
+		if delisted then
+			activityText = activityText .. "   " .. area
+		else
+			local mine = WQ.MyZone and WQ.MyZone()
+			activityText = activityText .. "   |cff" .. ((area == mine) and "40dd5a" or "9d9d9d")
+				.. area .. "|r"
+		end
+	end
 	row.Activity:SetText(activityText)
 	row.Activity:SetTextColor(activityColor.r, activityColor.g, activityColor.b)
 	row.NewPlayer:SetShown(Plain(info.newPlayerFriendly) and true or false)
@@ -2104,13 +2549,28 @@ local function FillHeader(header, category)
 end
 
 -- Blizzard's list keeps the scrollbar out of the way until it is needed.
+-- Blizzard's Send Message / Group Invite overlap the bottom of the list area,
+-- so the list stops above them: a row must never sit behind a button.
 local function PlaceScroll(needBar)
 	local scroll = view.Scroll
+	local buttons = LFGBrowseFrame and LFGBrowseFrame.SendMessageButton
 	scroll:ClearAllPoints()
 	scroll:SetPoint("TOPLEFT", view, "TOPLEFT", 3, -3)
-	scroll:SetPoint("BOTTOMRIGHT", view, "BOTTOMRIGHT", needBar and -18 or -2, 3)
+	scroll:SetPoint("RIGHT", view, "RIGHT", needBar and -18 or -2, 0)
+	if buttons then
+		scroll:SetPoint("BOTTOM", buttons, "TOP", 0, 6)
+	else
+		scroll:SetPoint("BOTTOM", view, "BOTTOM", 0, 3)
+	end
 	view.Bar:SetShown(needBar)
 	if not needBar then scroll:SetVerticalScroll(0) end
+end
+
+-- What the list can show without scrolling.
+local function ListHeight()
+	local height = view and view.Scroll and view.Scroll:GetHeight()
+	if height and height > 40 then return height end
+	return math.max(40, (view and view:GetHeight() or 0) - 48)
 end
 
 -- Lays out the kept listings in Blizzard's order, with Blizzard's
@@ -2188,7 +2648,7 @@ local function LayoutView(kept)
 
 	-- the scroll area is 21px narrower than the list with a scrollbar, 5px
 	-- without (Blizzard's own ScrollBox insets)
-	local needBar = y > (view:GetHeight() or 0) - 6
+	local needBar = y > ListHeight()
 	PlaceScroll(needBar)
 	content:SetHeight(math.max(1, y))
 	content:SetWidth(math.max(1, (view:GetWidth() or 0) - (needBar and 21 or 5)))
@@ -2208,13 +2668,9 @@ function RebuildView()
 	rebuildQueued = false
 	local frame = LFGBrowseFrame
 	if not (view and frame) then return end
-	-- our list also earns its place when the whisper queue has something to
-	-- show, filter or no filter
-	if not (FilterActive() or (WQ.On() and #WQ.items > 0)) then
-		pausedReason = nil
-		HideView()
-		return
-	end
+	-- our list is the list while the window is open, filter or no filter
+	-- (Arc, 2026-10-11: "I want the custom panel enabled as soon as I am
+	-- looking for a dungeon, even if the filter is not turned on yet")
 	if not frame:IsVisible() or frame.searching or frame.searchFailed then
 		HideView()
 		return
@@ -2334,7 +2790,7 @@ local function BuildView(frame)
 	invite:SetFrameLevel(buttonLevel)
 	invite:SetAllPoints(frame.GroupInviteButton)
 	invite:SetText(GROUP_INVITE or "Group Invite")
-	invite:SetScript("OnClick", function() InviteEntry(SelectedEntry()) end)
+	invite:SetScript("OnClick", function() InviteEntry(SelectedEntry(), invite) end)
 	v.SendButton, v.InviteButton = send, invite
 
 	v.hasDisplay = not (C_XMLUtil and C_XMLUtil.GetTemplateInfo)
@@ -2359,9 +2815,7 @@ end
 -- see if we can say close by or not"). Their zone comes from their own
 -- listing, or from your friends list when they are on it.
 function WQ.MyZone()
-	local zone = (GetRealZoneText and GetRealZoneText()) or (GetZoneText and GetZoneText())
-	if issecret(zone) or type(zone) ~= "string" or zone == "" then return nil end
-	return zone
+	return F.MyZone()
 end
 
 function WQ.AreaText(area)
@@ -2401,8 +2855,25 @@ function WQ.NewRow()
 	invite:SetScript("OnClick", function()
 		local entry = row.entry
 		if not entry then return end
+		if F.Blocked() then return end
+		local choices = F.NeedsRolePick(SoloListingOf(entry.name))
+		if choices then
+			NS.OpenPopup(invite, function(_, root)
+				root:CreateTitle("Inviting " .. FirstName(entry.name) .. " as")
+				for _, role in ipairs(choices) do
+					root:CreateButton(role.label, function()
+						F.pendingRole[entry.name] = role.label
+						entry.invited = true
+						Log("whisper queue: invited " .. entry.name .. " as " .. role.label)
+						C_PartyInfo.InviteUnit(entry.name)
+						WQ.Refresh()
+					end)
+				end
+			end)
+			return
+		end
 		entry.invited = true
-		Log("whisper queue: invited " .. entry.name)
+		Log("whisper queue: " .. (F.MustSuggest() and "suggested " or "invited ") .. entry.name)
 		C_PartyInfo.InviteUnit(entry.name)
 		WQ.Refresh()
 	end)
@@ -2455,7 +2926,8 @@ function WQ.FillRow(row, entry)
 	if entry.invited then bits[#bits + 1] = "invited" end
 	row.Meta:SetText(table.concat(bits, "   "))
 	row.Text:SetText(entry.text)
-	row.InviteButton:SetEnabled(not entry.invited)
+	row.InviteButton:SetText(F.InviteLabel(true))
+	row.InviteButton:SetEnabled(not entry.invited and not F.Blocked())
 	row:Show()
 end
 
@@ -2476,11 +2948,13 @@ end
 -- Menu
 -------------------------------------------------------------------------------
 
--- A filter change starts the list from the top.
+-- A filter change starts the list from the top, and is remembered.
 local function Changed()
+	F.Save()
 	if view then view.Scroll:SetVerticalScroll(0) end
 	RebuildView()
 end
+F.Changed = Changed -- the per-class role toggles live above this point
 
 local function IsRoleOn(key)
 	return active[key] == true
@@ -2500,6 +2974,14 @@ local function SetShowMode(key)
 	showMode = key
 	Log("menu: show " .. key)
 	Changed()
+end
+
+-- Keeps only listings standing in your zone, at their dungeon, or in the
+-- zone that dungeon sits in. Groups are judged by their leader.
+function F.ToggleNearby()
+	F.nearby = not F.nearby
+	Log("menu: only ones near me -> " .. (F.nearby and "ON" or "off"))
+	if F.Changed then F.Changed() end
 end
 
 local function IsOpenSpotOn()
@@ -2522,8 +3004,11 @@ local function ToggleClass(classFile)
 	Changed()
 end
 
+-- Any class clears the per-class roles with it: a role left on a class nobody
+-- ticked keeps filtering while nothing on screen says so.
 local function ClearClasses()
 	wipe(classActive)
+	wipe(F.classRoles)
 	Log("menu: any class")
 	Changed()
 end
@@ -2689,7 +3174,28 @@ local function AddClassBoxes(menu, forGroups, ticked, isOn, toggle)
 		-- the class icon Blizzard draws on its own listings, when it has one
 		local atlas = "groupfinder-icon-class-" .. classFile:lower()
 		if C_Texture.GetAtlasInfo(atlas) then label = Icon(atlas) .. " " .. label end
-		menu:CreateCheckbox(string.format("%s (%d)", label, counts[classFile]), isOn, toggle, classFile)
+		local text = string.format("%s (%d)", label, counts[classFile])
+		-- the roles picked for this class ride on its own line
+		local picked = not forGroups and F.ClassRoles(classFile)
+		if picked then
+			local icons = {}
+			for _, role in ipairs(ROLES) do
+				if picked[role.key] then icons[#icons + 1] = Icon(ROLE_ATLAS[role.key]) end
+			end
+			text = text .. "  " .. table.concat(icons, " ")
+		end
+		local box = menu:CreateCheckbox(text, isOn, toggle, classFile)
+		-- Hovering a class opens its own role list (Arc, 2026-10-11: "for this
+		-- class I only want to see healer and tank"). Clicking still ticks the
+		-- class itself; the group list has no roles to pick.
+		if not forGroups then
+			local any = box:CreateButton("Any role", F.ClearClassRoles, classFile)
+			any:SetResponse(REFRESH)
+			for _, role in ipairs(ROLES) do
+				box:CreateCheckbox(Icon(ROLE_ATLAS[role.key]) .. " " .. role.label,
+					F.IsClassRole, F.ToggleClassRole, classFile .. ":" .. role.key)
+			end
+		end
 	end
 end
 
@@ -2697,14 +3203,68 @@ local function ClearAll()
 	wipe(active)
 	wipe(classActive)
 	wipe(groupExclude)
+	wipe(F.mustClass)
 	wipe(groupNeeds)
 	wipe(groupHas)
+	wipe(F.classRoles)
 	showMode = "both"
 	openSpotOnly = false
 	minLevel = nil
+	F.nearby = false
 	Log("menu: reset filter")
 	Changed()
 end
+
+-------------------------------------------------------------------------------
+-- What the panel is allowed to touch (ALF_Panel.lua). The rules stay in this
+-- file; the panel only reads and flips them through this one table, so it
+-- never reaches into these locals and a rule has exactly one owner.
+-------------------------------------------------------------------------------
+
+NS.filter = {
+	modes = SHOW_MODES, roles = ROLES, roleAtlas = ROLE_ATLAS,
+	isMode = IsShowMode, setMode = SetShowMode,
+	isRole = IsRoleOn, toggleRole = ToggleRole,
+	classChoices = ClassChoices, classLabel = ClassLabel,
+	isClass = IsClassOn, toggleClass = ToggleClass, clearClasses = ClearClasses,
+	anyClass = AnyClassTicked,
+	tickedClasses = function() return classActive end,
+	hiddenClasses = function() return groupExclude end,
+	isClassRole = function(classFile, key) return F.IsClassRole(classFile .. ":" .. key) end,
+	toggleClassRole = function(classFile, key) F.ToggleClassRole(classFile .. ":" .. key) end,
+	clearClassRoles = function(classFile) F.ClearClassRoles(classFile) end,
+	-- "T H" for a class the roles are narrowed on, nil when it takes any role
+	classRoleLetters = function(classFile)
+		local set = classFile and F.ClassRoles(classFile)
+		if not set then return nil end
+		local out = {}
+		for _, role in ipairs(ROLES) do
+			if set[role.key] then out[#out + 1] = role.letter end
+		end
+		return table.concat(out, " ")
+	end,
+	minLevelText = MinLevelText, setMinLevel = SetMinLevel,
+	isNearby = F.IsNearbyOn, toggleNearby = F.ToggleNearby, myZone = F.MyZone,
+	isSpot = IsOpenSpotOn, toggleSpot = ToggleOpenSpot, myRolesText = MyRolesText,
+	isNeed = IsGroupNeed, toggleNeed = ToggleGroupNeed,
+	isHas = IsGroupHas, toggleHas = ToggleGroupHas,
+	isHidden = IsGroupClassHidden, toggleHidden = ToggleGroupClass,
+	classState = F.ClassState, cycleClass = F.CycleClass,
+	anyClassState = F.AnyClassState, clearClassStates = F.ClearClassStates,
+	isMine = F.IsMine, toggleMine = F.ToggleMine,
+	whisperOn = WhisperOn, toggleWhisper = ToggleWhisper,
+	queueOn = WQ.On, toggleQueue = WQ.Toggle,
+	message = MessageTemplate, setMessage = SetTypedMessage, messageMax = MAX_TEMPLATE,
+	quickSlots = QM.SLOTS, quickText = QM.Text, setQuickText = QM.Set,
+	quickFirst = QM.First, setQuickFirst = QM.SetFirst,
+	openSettings = ShowSettings,
+	reset = ClearAll, status = StatusText, active = FilterActive,
+	paused = function() return pausedReason ~= nil end,
+	-- whether the panel was left open, so the window brings it back
+	panelOpen = function() return (db and db.panel == true) and true or false end,
+	setPanelOpen = function(on) if db then db.panel = on and true or nil end end,
+	log = Log,
+}
 
 local function BuildMenu(owner, root)
 	root:CreateTitle("Show")
@@ -2723,6 +3283,7 @@ local function BuildMenu(owner, root)
 	-- Typed minimum level; combines with the rest. Empty = any level.
 	root:CreateInput("Minimum level", MinLevelText, SetMinLevel,
 		{ numeric = true, maxLetters = 2, placeholder = "any" })
+	root:CreateCheckbox("Only ones near me", F.IsNearbyOn, F.ToggleNearby)
 	root:CreateDivider()
 	root:CreateTitle("Groups")
 	root:CreateCheckbox("Has a spot for me (" .. MyRolesText() .. ")", IsOpenSpotOn, ToggleOpenSpot)
@@ -2778,7 +3339,7 @@ local function SummaryLines()
 	end
 	if showMode ~= "groups" then
 		if AnyRoleTicked() then lines[#lines + 1] = "Players signed up as: " .. ActiveNames() end
-		if AnyClassTicked() then lines[#lines + 1] = "Player classes: " .. ClassNames(classActive) end
+		if AnyClassTicked() then lines[#lines + 1] = "Player classes: " .. ClassNames(classActive, true) end
 		if minLevel then lines[#lines + 1] = "Player level: " .. minLevel .. "+" end
 	end
 	if showMode ~= "players" then
@@ -2786,6 +3347,10 @@ local function SummaryLines()
 		if AnyGroupNeeds() then lines[#lines + 1] = "Groups with an open spot for: " .. RoleNames(groupNeeds) end
 		if AnyGroupHas() then lines[#lines + 1] = "Groups that already have: " .. RoleNames(groupHas) end
 		if AnyGroupExclusion() then lines[#lines + 1] = "Hiding groups with: " .. ClassNames(groupExclude) end
+		if next(F.mustClass) then lines[#lines + 1] = "Groups that must have: " .. ClassNames(F.mustClass) end
+	end
+	if F.nearby then
+		lines[#lines + 1] = "Near me: " .. (F.MyZone() or "your zone") .. ", or at the dungeon"
 	end
 	return lines
 end
@@ -2811,6 +3376,8 @@ local function ShowTooltip(button)
 		GameTooltip:AddLine("Invite whisper is on.", 0.25, 0.79, 0.95)
 	end
 	for _, add in ipairs(NS.tooltipExtras) do add(GameTooltip) end
+	GameTooltip:AddLine(" ")
+	GameTooltip:AddLine("Click to open the filter panel.", 0.7, 0.7, 0.7)
 	GameTooltip:Show()
 end
 
@@ -2830,11 +3397,7 @@ local function OnBlizzardRedraw()
 	if results and not issecret(results) then
 		Log(string.format("blizzard: list rebuilt, %d listings (searching=%s)", #results, S(frame.searching)))
 	end
-	if FilterActive() or (WQ.On() and #WQ.items > 0) then
-		RebuildView()
-	elseif view and view:IsShown() then
-		view:Hide()
-	end
+	RebuildView()
 end
 
 local events = CreateFrame("Frame")
@@ -2848,7 +3411,7 @@ end)
 
 local function Setup()
 	local frame = LFGBrowseFrame
-	if filterButton then return end
+	if frames.button then return end
 	if not (frame and frame.RefreshButton and frame.Inset and frame.SendMessageButton and frame.GroupInviteButton) then
 		Log("setup: the Looking For Group browse frame is not what this addon expects - nothing installed")
 		return
@@ -2884,18 +3447,38 @@ local function Setup()
 
 	button:SetScript("OnMouseDown", function(self) self.Icon:SetPoint("CENTER", self, "CENTER", -2, -1) end)
 	button:SetScript("OnMouseUp", function(self) self.Icon:SetPoint("CENTER", self, "CENTER", -1, 0) end)
-	button:SetScript("OnClick", function(self)
+	button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	button:SetScript("OnClick", function(self, mouseButton)
 		GameTooltip_Hide()
-		-- our own menu, never Blizzard's (see "Popup menus"); a second click closes it
-		if PopupOpenFor(self) then
-			ClosePopup()
-		else
-			NS.OpenPopup(self, BuildMenu)
+		-- right-click still opens the old menu: a fallback while the panel is
+		-- new, and our own menu, never Blizzard's (see "Popup menus")
+		if mouseButton == "RightButton" then
+			if PopupOpenFor(self) then
+				ClosePopup()
+			else
+				NS.OpenPopup(self, BuildMenu)
+			end
+			return
 		end
+		ClosePopup()
+		if NS.Panel then NS.Panel.Toggle() end
 	end)
 	button:SetScript("OnEnter", ShowTooltip)
 	button:SetScript("OnLeave", GameTooltip_Hide)
-	filterButton = button
+	frames.button = button
+
+	-- The options panel, docked to the window. It is our own frame: the
+	-- window is never resized, re-anchored or written to.
+	if NS.Panel then
+		NS.Panel.Build(frame)
+		frame:HookScript("OnShow", NS.Panel.OnWindowShown)
+		frame:HookScript("OnHide", NS.Panel.OnWindowHidden)
+		if LFGParentFrame then
+			LFGParentFrame:HookScript("OnShow", NS.Panel.OnWindowShown)
+			LFGParentFrame:HookScript("OnHide", NS.Panel.OnWindowHidden)
+		end
+		if frame:IsShown() then NS.Panel.OnWindowShown() end
+	end
 
 	Log(string.format("setup: own list built (role display=%s), read-only hook on UpdateResults; funnel icon=%s",
 		S(view.hasDisplay), S(hasFunnel)))
@@ -2912,7 +3495,7 @@ loader:SetScript("OnEvent", function(self, event, name)
 	elseif name == "Blizzard_GroupFinder_VanillaStyle" then
 		Setup()
 	end
-	if db and filterButton then self:UnregisterEvent("ADDON_LOADED") end
+	if db and frames.button then self:UnregisterEvent("ADDON_LOADED") end
 end)
 if C_AddOns.IsAddOnLoaded("Blizzard_GroupFinder_VanillaStyle") then
 	Setup()
