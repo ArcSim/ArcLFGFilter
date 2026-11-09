@@ -698,16 +698,24 @@ function SP.BuildSideTab()
 	if C_Texture.GetAtlasInfo(TAB_SEL) then selected:SetAtlas(TAB_SEL, true) end
 	selected:SetAllPoints()
 	selected:Hide()
-	-- the size, trim and offset the window gives its own tab icons
+	-- The window's tabs do not draw their icon at its own size: LFGVanillaRightTab
+	-- sets fillToInterior, so SidePanelTabButtonMixin.UpdateIconInterior blows the
+	-- icon up to interiorExtent, 50, and lets the tab mask cut it back to the
+	-- interior. That is why their art runs to the frame with no stone around it,
+	-- and why an icon drawn at its own 30 sits in a ring of it. Same number here,
+	-- same offset, and the mask at its own size, centred, as their template has it.
 	local icon = tab:CreateTexture(nil, "ARTWORK")
-	icon:SetSize(30, 30)
+	icon:SetSize(50, 50)
 	icon:SetPoint("CENTER", -3, 0)
 	icon:SetTexture(ICON)
-	icon:SetTexCoord(0.03125, 0.96875, 0.03125, 0.96875)
+	-- Their art is full bleed, so whatever survives the cut is picture. Ours is a
+	-- framed logo, so it is cropped to the middle third first, past its border and
+	-- the dark behind the eye, and the cut lands inside that.
+	icon:SetTexCoord(0.333, 0.667, 0.333, 0.667)
 	local mask = C_Texture.GetAtlasInfo(TAB_MASK) and tab.CreateMaskTexture and tab:CreateMaskTexture()
 	if mask and icon.AddMaskTexture then
 		mask:SetAtlas(TAB_MASK, true)
-		mask:SetAllPoints(bg)
+		mask:SetPoint("CENTER")
 		icon:AddMaskTexture(mask)
 	end
 	if C_Texture.GetAtlasInfo(TAB_HI) and tab.SetHighlightAtlas then
@@ -721,6 +729,7 @@ function SP.BuildSideTab()
 	end)
 	SP.Tip(tab, "Arc Filter", "Open the filter panel.")
 	tab.Selected = selected
+	tab.Icon = icon
 	tab:Hide()
 	SP.sideTab = tab
 end

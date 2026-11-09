@@ -1,5 +1,10 @@
 # Arc LFG Filter changelog
 
+## 1.3.1
+
+### Bug Fixes
+- **The filter tab fills its tab** - The eye sat small in the middle of the fourth tab with dark around it. It is drawn at the size the window gives its own tab icons now, so it runs to the frame like the three above it.
+
 ## 1.3.0
 
 ### New Features
