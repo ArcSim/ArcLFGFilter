@@ -1,5 +1,11 @@
 # Arc LFG Filter changelog
 
+## 1.3.2
+
+### Bug Fixes
+- **The filter tab shows the whole eye** - Filling the tab in 1.3.1 meant blowing up the addon's framed logo, so the fourth tab wore a slice of the eye enlarged past its own border. The tab has art of its own now, drawn for the shape a tab shows, so you see the eye instead of a piece of it.
+- **A lit filter tab gets its ring** - Opening the panel lit the fourth tab but left a bare strip down its right side, where the window's own tabs show a gold ring. The ring draws around the art now, both edges, the way the three tabs above it do.
+
 ## 1.3.1
 
 ### Bug Fixes
